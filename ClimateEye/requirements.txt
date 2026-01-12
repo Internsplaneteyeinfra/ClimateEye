@@ -1,0 +1,14 @@
+Flask
+flask-cors
+
+python-dotenv
+
+requests
+requests-cache
+retry-requests
+
+openmeteo-requests
+
+groq
+
+numpy
