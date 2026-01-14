@@ -2,36 +2,20 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>updated</title>
+<title>AQI Raster Visualization</title>
 
-<!-- Leaflet -->
-<link
-  rel="stylesheet"
-  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-/>
-
-<!-- Leaflet Draw -->
-<link
-  rel="stylesheet"
-  href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"
-/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
 
 <style>
-  body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-  }
-
-  #map {
-    height: 100vh;
-    width: 100%;
-  }
+  body { margin: 0; font-family: Arial, sans-serif; }
+  #map { height: 100vh; width: 100%; }
 
   .panel {
     position: absolute;
     top: 10px;
     left: 10px;
-    z-index: 999;
+    z-index: 1000;
     background: #fff;
     padding: 10px;
     width: 260px;
@@ -39,16 +23,8 @@
     box-shadow: 0 2px 10px rgba(0,0,0,0.2);
   }
 
-  .panel h3 {
-    margin: 0 0 10px;
-    font-size: 16px;
-  }
-
-  .panel label {
-    font-size: 12px;
-    font-weight: bold;
-  }
-
+  .panel h3 { margin: 0 0 10px; font-size: 16px; }
+  .panel label { font-size: 12px; font-weight: bold; }
   .panel input, .panel button {
     width: 100%;
     margin-top: 5px;
@@ -62,54 +38,41 @@
     cursor: pointer;
     border-radius: 4px;
   }
-
-  .panel button:hover {
-    background: #004fcc;
-  }
 </style>
 </head>
 
 <body>
 
 <div class="panel">
-  <h3>AQI Tile Tester</h3>
+  <h3>AQI Raster Tester</h3>
 
   <label>Tile Size (km)</label>
   <input type="number" id="tileSize" value="0.5" step="0.1" />
 
-  <label>Date (optional, defaults to today)</label>
+  <label>Date</label>
   <input type="date" id="date" />
 
-  <button onclick="fetchTiles()">Fetch AQI Tiles</button>
+  <button onclick="applyAQI()">Apply AQI</button>
 </div>
 
 <div id="map"></div>
 
-<!-- Scripts -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
 
 <script>
 /* ---------------- MAP SETUP ---------------- */
-const map = L.map('map').setView([20.01, 73.72], 14);
+const map = L.map("map").setView([20.01, 73.72], 14);
 
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  attribution: '© OpenStreetMap'
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "© OpenStreetMap"
 }).addTo(map);
-
-// Generate URL based on map
-function updateURL() {
-  const c = map.getCenter();
-  const z = map.getZoom();
-  history.replaceState({}, "", `?lat=${c.lat.toFixed(5)}&lon=${c.lng.toFixed(5)}&z=${z}`);
-}
-map.on("moveend", updateURL);
 
 /* ---------------- DRAW CONTROLS ---------------- */
 const drawnItems = new L.FeatureGroup();
 map.addLayer(drawnItems);
 
-const drawControl = new L.Control.Draw({
+map.addControl(new L.Control.Draw({
   draw: {
     polygon: true,
     rectangle: true,
@@ -118,45 +81,62 @@ const drawControl = new L.Control.Draw({
     marker: false,
     circlemarker: false
   },
-  edit: {
-    featureGroup: drawnItems
-  }
-});
-map.addControl(drawControl);
+  edit: { featureGroup: drawnItems }
+}));
 
 let selectedPolygon = null;
 
-map.on(L.Draw.Event.CREATED, function (e) {
+map.on(L.Draw.Event.CREATED, e => {
   drawnItems.clearLayers();
   drawnItems.addLayer(e.layer);
   selectedPolygon = e.layer.getLatLngs()[0];
 });
 
-/* ---------------- AQI TILE FETCH ---------------- */
-let tileLayerGroup = L.layerGroup().addTo(map);
+map.on("click", function (e) {
+  fetch("http://localhost:5000/api/aqi/value", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      lat: e.latlng.lat,
+      lon: e.latlng.lng
+    })
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (!data.inside) return;
 
-function fetchTiles() {
+    L.popup()
+      .setLatLng(e.latlng)
+      .setContent(`
+        <b>AQI:</b> ${data.aqi}<br/>
+        <b>Category:</b> ${data.category}
+      `)
+      .openOn(map);
+  });
+});
+
+/* ---------------- AQI RASTER LAYER ---------------- */
+let aqiRasterLayer = null;
+
+function applyAQI() {
   if (!selectedPolygon) {
     alert("Please draw a polygon first");
     return;
   }
 
-  tileLayerGroup.clearLayers();
-
   const polygon = selectedPolygon.map(p => [p.lat, p.lng]);
-
-  const selectedDate =
-  document.getElementById("date").value ||
-  new Date().toISOString().split("T")[0];
+  const date =
+    document.getElementById("date").value ||
+    new Date().toISOString().split("T")[0];
 
   const payload = {
-    polygon: polygon,
-    start_date: selectedDate,
-    end_date: selectedDate,
+    polygon,
+    start_date: date,
+    end_date: date,
     tile_size_km: parseFloat(document.getElementById("tileSize").value)
   };
 
-
+  /* 1️⃣ Call existing tiles API (NO DRAWING) */
   fetch("http://localhost:5000/api/aqi/tiles", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -164,34 +144,24 @@ function fetchTiles() {
   })
   .then(res => res.json())
   .then(data => {
-    if (!data.tiles) {
-      alert("No tiles returned");
-      return;
+    if (aqiRasterLayer) {
+      map.removeLayer(aqiRasterLayer);
     }
 
-    data.tiles.forEach(tile => {
-      const b = tile.bounds;
+    /* 2️⃣ Add raster AQI tiles */
+    aqiRasterLayer = L.tileLayer(
+      "http://localhost:5000/api/aqi/raster/{z}/{x}/{y}.png",
+      {
+        opacity: 0.75,
+        zIndex: 600
+      }
+    );
 
-      const rect = L.rectangle(
-        [[b.min_lat, b.min_lon], [b.max_lat, b.max_lon]],
-        {
-          color: tile.color,
-          weight: 0,
-          fillOpacity: 0.45
-        }
-      ).bindPopup(`
-        <b>AQI (10m):</b> ${tile.aqi}<br/>
-        <b>Category:</b> ${tile.category}<br/>
-        <b>PM2.5:</b> ${tile.pm2_5}
-
-      `);
-
-      tileLayerGroup.addLayer(rect);
-    });
+    aqiRasterLayer.addTo(map);
   })
   .catch(err => {
     console.error(err);
-    alert("Error calling backend");
+    alert("Backend error");
   });
 }
 </script>

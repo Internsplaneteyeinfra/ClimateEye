@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
 import openmeteo_requests
@@ -7,6 +7,10 @@ from retry_requests import retry
 import logging,os
 from groq import Groq
 from dotenv import load_dotenv
+import math
+import random
+from io import BytesIO
+from PIL import Image
 
 load_dotenv()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -18,6 +22,7 @@ def get_next_hour_record(hourly_records, current_hour):
             if i + 1 < len(hourly_records):
                 return hourly_records[i + 1]
     return None
+
 
 def get_current_hour_record(hourly_records):
     """
@@ -608,6 +613,120 @@ Rules:
 - Do NOT exaggerate certainty.
 """
 
+# NEW: AQI visualization palette (GLOBAL)
+AQI_VIS_PARAMS = {
+    "min": 0,
+    "max": 500,
+    "palette": [
+        "#00e400",  # Good
+        "#ffff00",  # Moderate
+        "#ff7e00",  # Poor
+        "#ff0000",  # Unhealthy
+        "#8f3f97",  # Very Unhealthy
+        "#7e0023",  # Hazardous
+    ]
+}
+
+def latlon_to_tile(lat, lon, z):
+    lat_rad = math.radians(lat)
+    n = 2.0 ** z
+    xtile = int((lon + 180.0) / 360.0 * n)
+    ytile = int(
+        (1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi)
+        / 2.0 * n
+    )
+    return xtile, ytile
+
+
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def get_palette_color(aqi):
+    breaks = [50, 100, 150, 200, 300, 500]
+    for i, b in enumerate(breaks):
+        if aqi <= b:
+            return hex_to_rgb(AQI_VIS_PARAMS["palette"][i])
+    return hex_to_rgb(AQI_VIS_PARAMS["palette"][-1])
+
+def interpolate_aqi(lat, lon, tiles, radius_km=2.0):
+    """
+    Inverse Distance Weighting (IDW)
+    Smooth AQI interpolation
+    """
+    total = 0
+    weight_sum = 0
+
+    for tile in tiles:
+        tlat = tile["lat"]
+        tlon = tile["lon"]
+        aqi = tile["aqi"]
+
+        d = haversine_km(lat, lon, tlat, tlon)
+        if d > radius_km:
+            continue
+
+        d = max(d, 0.0001)  # avoid divide by zero
+
+        w = 1 / (d ** 2)
+        total += w * aqi
+        weight_sum += w
+
+    return int(total / weight_sum) if weight_sum > 0 else 0
+
+
+def generate_spatial_points_from_tile(tile, points_per_tile=6):
+    """
+    Convert ONE tile AQI into MULTIPLE spatial AQI points
+    (this is what enables blending)
+    """
+    points = []
+
+    b = tile["bounds"]
+    aqi = tile["aqi"]
+
+    for _ in range(points_per_tile):
+        lat = random.uniform(b["min_lat"], b["max_lat"])
+        lon = random.uniform(b["min_lon"], b["max_lon"])
+
+        points.append({
+            "lat": lat,
+            "lon": lon,
+            "aqi": aqi
+        })
+
+    return points
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dlat / 2) ** 2 +
+        math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+
+    return 2 * R * math.asin(math.sqrt(a))
+
+def pixel_to_latlon(px, py, z, x, y):
+    n = 2 ** z
+    lon = (x * 256 + px) / (256 * n) * 360.0 - 180.0
+    lat_rad = math.atan(
+        math.sinh(math.pi * (1 - 2 * (y * 256 + py) / (256 * n)))
+    )
+    lat = math.degrees(lat_rad)
+    return lat, lon
+
+
+AQI_TILE_CACHE = {
+    "tiles": [],
+    "meta": {}
+}
 
 app = Flask(__name__)
 CORS(app)
@@ -2612,13 +2731,13 @@ def get_aqi_tiles():
                 # ================= DUMMY AQI MAPPING (VISUAL TESTING ONLY) =================
 
                 DUMMY_AQI_GROUPS = [
-                    25, 25, 25,25,              # Good
-                    75, 75, 75, 75,             # Moderate
-                    110, 110, 110, 110,         # Poor
-                    155, 155, 155, 155,         # Unhealthy
-                    190, 190, 190,190,          # Unhealthy
-                    260, 260, 260, 260,         # Severe
-                    310, 310 ,310,310           # Hazardous
+                    25, 25, 25,              # Good
+                    75, 75, 75,             # Moderate
+                    110, 110, 110,          # Poor
+                    155, 155, 155,         # Unhealthy
+                    190, 190, 190,         # Unhealthy
+                    260, 260, 260,        # Severe
+                    310, 310 ,310,          # Hazardous
                 ]
 
                 aqi = DUMMY_AQI_GROUPS[tile_index % len(DUMMY_AQI_GROUPS)]
@@ -2639,7 +2758,6 @@ def get_aqi_tiles():
                     "center": tile["center"],
                     "bounds": tile["bounds"],
                     "aqi": int(aqi),                 # 10m AQI ONLY
-                    "aqi_0to3m": None,               # disabled
                     "color": color_info["color"],
                     "category": color_info["category"],
                     "label": color_info["label"],
@@ -2666,6 +2784,31 @@ def get_aqi_tiles():
             "max_aqi": int(max(aqi_values)) if aqi_values else None
         }
 
+        # 🔥 NEW: Build spatial AQI point cloud (NO LOGIC CHANGE)
+        spatial_points = []
+
+        for tile in tile_results:
+            spatial_points.extend(
+                generate_spatial_points_from_tile(tile, points_per_tile=6)
+            )
+
+        AQI_TILE_CACHE["points"] = spatial_points
+        AQI_TILE_CACHE["bounds"] = bounds_data
+
+
+         # NEW: AQI TILE URL (FINAL VISUALIZATION)
+        aqi_tile_url = (
+            f"http://localhost:5000/api/aqi/raster/{{z}}/{{x}}/{{y}}.png"
+            f"?start_date={start_date}&end_date={end_date}"
+        )
+
+
+        # 🔥 Store tiles for raster rendering (NO LOGIC CHANGE)
+        AQI_TILE_CACHE["tiles"] = tile_results
+        AQI_TILE_CACHE["bounds"] = bounds_data
+        AQI_TILE_CACHE["polygon"] = polygon
+
+
         return jsonify({
             "tiles": tile_results,
             "summary": summary,
@@ -2673,6 +2816,7 @@ def get_aqi_tiles():
             "start_date": start_date,
             "end_date": end_date,
             "tile_size_km": tile_size_km,
+            "aqi_tile_url": aqi_tile_url  
         }), 200
         
     except Exception as e:
@@ -2684,6 +2828,83 @@ def get_aqi_tiles():
             'error': f'Failed to fetch tile-based AQI data: {str(e)}',
             'details': 'Please check the backend logs for more information'
         }), 500
+
+
+@app.route("/api/aqi/raster/<int:z>/<int:x>/<int:y>.png", methods=["GET"])
+def aqi_raster_tile(z, x, y):
+
+    TILE_SIZE = 256
+    img = Image.new("RGBA", (TILE_SIZE, TILE_SIZE))
+    pixels = img.load()
+
+    # 🔹 Cached data (NO logic change)
+    polygon = AQI_TILE_CACHE.get("polygon")
+    points = AQI_TILE_CACHE.get("points", [])
+
+    # 🔹 Safety check
+    if not polygon or not points:
+        buffer = BytesIO()
+        img.save(buffer, format="PNG")
+        buffer.seek(0)
+        return send_file(buffer, mimetype="image/png")
+
+    # 🔹 Raster pixel loop
+    for py in range(TILE_SIZE):
+        for px in range(TILE_SIZE):
+
+            # 1️⃣ pixel → lat/lon
+            lat, lon = pixel_to_latlon(px, py, z, x, y)
+
+            # 2️⃣ polygon mask
+            if not point_in_polygon(lat, lon, polygon):
+                pixels[px, py] = (0, 0, 0, 0)
+                continue
+
+            # 3️⃣ AQI interpolation (dummy / real – SAME source)
+            aqi = interpolate_aqi(lat, lon, points)
+
+            if aqi is None:
+                pixels[px, py] = (0, 0, 0, 0)
+                continue
+
+            # 4️⃣ Color
+            color = get_palette_color(aqi)
+            pixels[px, py] = (*color, 170)  # smooth blending
+
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+
+    return send_file(buffer, mimetype="image/png")
+
+
+
+@app.route("/api/aqi/value", methods=["POST"])
+def get_aqi_at_point():
+    data = request.get_json()
+    lat = data.get("lat")
+    lon = data.get("lon")
+
+    polygon = AQI_TILE_CACHE.get("polygon")
+    points = AQI_TILE_CACHE.get("points", [])
+
+    # Outside selected region → no data
+    if not polygon or not point_in_polygon(lat, lon, polygon):
+        return jsonify({"inside": False})
+
+    # Same interpolation as raster
+    aqi = interpolate_aqi(lat, lon, points)
+
+    if aqi is None:
+        return jsonify({"inside": True, "aqi": None})
+
+    category = get_aqi_category(aqi)
+
+    return jsonify({
+        "inside": True,
+        "aqi": int(aqi),
+        "category": category
+    })
 
 
 @app.route('/api/health', methods=['GET'])
