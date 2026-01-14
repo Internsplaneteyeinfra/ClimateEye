@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
-import requests
+import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 import logging,os
@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 
 def get_next_hour_record(hourly_records, current_hour):
@@ -63,6 +62,221 @@ def get_aqi_category(aqi):
             return label
     return "Unknown"
 
+def get_aqi_color(aqi):
+    """
+    Get color for AQI value based on US EPA standards
+    Returns hex color code and category
+    """
+    if aqi is None:
+        return {"color": "#808080", "category": "Unknown", "label": "No Data"}
+    
+    if aqi <= 50:
+        return {"color": "#00E400", "category": "Good", "label": "Good"}
+    elif aqi <= 100:
+        return {"color": "#FFFF00", "category": "Moderate", "label": "Moderate"}
+    elif aqi <= 150:
+        return {"color": "#FF7E00", "category": "Poor", "label": "Unhealthy for Sensitive Groups"}
+    elif aqi <= 200:
+        return {"color": "#FF0000", "category": "Unhealthy", "label": "Unhealthy"}
+    elif aqi <= 300:
+        return {"color": "#8F3F97", "category": "Severe", "label": "Very Unhealthy"}
+    else:
+        return {"color": "#7E0023", "category": "Hazardous", "label": "Hazardous"}
+
+def point_in_polygon(lat, lon, polygon):
+    """
+    Check if a point (lat, lon) is inside a polygon using ray casting algorithm
+    
+    Parameters:
+    - lat, lon: Point coordinates (latitude, longitude)
+    - polygon: List of [latitude, longitude] pairs forming a closed polygon
+    
+    Returns:
+    - True if point is inside polygon, False otherwise
+    """
+    if not polygon or len(polygon) < 3:
+        return False
+    
+    # Ensure polygon is closed (first point == last point)
+    poly = polygon[:]
+    if poly[0] != poly[-1]:
+        poly.append(poly[0])
+    
+    inside = False
+    j = len(poly) - 1
+    
+    for i in range(len(poly) - 1):
+        xi, yi = poly[i]  # xi = lat, yi = lon
+        xj, yj = poly[j]  # xj = lat, yj = lon
+        
+        # Check if horizontal ray from point crosses edge
+        # Ray goes from (lat, lon) to (lat, infinity)
+        # Edge goes from (xi, yi) to (xj, yj)
+        
+        # Check if ray crosses this edge
+        if ((yi > lon) != (yj > lon)):  # Edge crosses horizontal line at point's longitude
+            # Calculate x-coordinate of intersection
+            if yj != yi:  # Avoid division by zero
+                x_intersect = (lon - yi) * (xj - xi) / (yj - yi) + xi
+                if lat < x_intersect:  # Point is to the left of intersection
+                    inside = not inside
+        
+        j = i
+    
+    return inside
+
+def get_polygon_bounds(polygon):
+    """
+    Calculate bounding box from polygon coordinates
+    
+    Parameters:
+    - polygon: List of [latitude, longitude] pairs
+    
+    Returns:
+    - Dictionary with min_lat, max_lat, min_lon, max_lon
+    """
+    if not polygon:
+        return None
+    
+    lats = [point[0] for point in polygon]
+    lons = [point[1] for point in polygon]
+    
+    return {
+        "min_lat": min(lats),
+        "max_lat": max(lats),
+        "min_lon": min(lons),
+        "max_lon": max(lons)
+    }
+
+def generate_tiles_from_bounds(min_lat, max_lat, min_lon, max_lon, tile_size_km=0.5):
+    """
+    Generate uniform grid tiles within a bounding box using pure coordinate-based geometry.
+    
+    This function is completely direction-agnostic. It treats coordinates purely as spatial values
+    without any directional bias. All calculations are based on coordinate mathematics only.
+    
+    Algorithm:
+    1. Convert tile size from kilometers to coordinate degrees (accounting for latitude-dependent longitude scaling)
+    2. Calculate grid dimensions based on spatial coordinate ranges
+    3. Generate uniform grid cells covering the bounding box
+    4. Each tile is defined by its coordinate boundaries and center point
+    
+    Parameters:
+    - min_lat, max_lat: Minimum and maximum latitude coordinates (degrees)
+    - min_lon, max_lon: Minimum and maximum longitude coordinates (degrees)
+    - tile_size_km: Size of each tile in kilometers (default 0.5 km = 500m)
+    
+    Returns:
+    - List of tile dictionaries, each containing:
+      - tile_id: Unique identifier (row_column format)
+      - center: {latitude, longitude} - center point for AQI calculation
+      - bounds: {min_lat, max_lat, min_lon, max_lon} - coordinate boundaries (direction-agnostic)
+    """
+    import math
+    
+    # Validate bounds (purely geometric validation)
+    if max_lat <= min_lat or max_lon <= min_lon:
+        return []
+    
+    # Coordinate-to-distance conversion factors (purely geometric, no directional bias)
+    # 1 degree latitude ≈ 111 km (constant, independent of location)
+    # 1 degree longitude ≈ 111 km * cos(latitude) (varies by latitude due to Earth's curvature)
+    avg_lat = (min_lat + max_lat) / 2
+    lat_km_per_deg = 111.0
+    lon_km_per_deg = 111.0 * math.cos(math.radians(avg_lat))
+    
+    # Convert tile size from kilometers to coordinate degrees
+    # This ensures each tile represents approximately tile_size_km × tile_size_km area
+    tile_lat_deg = tile_size_km / lat_km_per_deg
+    tile_lon_deg = tile_size_km / lon_km_per_deg
+    
+    # Calculate spatial ranges (coordinate differences)
+    lat_range = max_lat - min_lat
+    lon_range = max_lon - min_lon
+    
+    # Calculate number of tiles needed to cover the bounding box
+    # Use ceiling to ensure full coverage
+    num_tiles_lat = max(1, int(math.ceil(lat_range / tile_lat_deg)))
+    num_tiles_lon = max(1, int(math.ceil(lon_range / tile_lon_deg)))
+    
+    tiles = []
+    
+    # Generate uniform grid - iterate through grid positions (i, j)
+    for i in range(num_tiles_lat):
+        for j in range(num_tiles_lon):
+            # Calculate tile coordinate boundaries (purely geometric)
+            tile_min_lat = min_lat + (i * tile_lat_deg)
+            tile_max_lat = min(max_lat, tile_min_lat + tile_lat_deg)
+            tile_min_lon = min_lon + (j * tile_lon_deg)
+            tile_max_lon = min(max_lon, tile_min_lon + tile_lon_deg)
+            
+            # Calculate center point (for AQI data fetching)
+            center_lat = (tile_max_lat + tile_min_lat) / 2
+            center_lon = (tile_max_lon + tile_min_lon) / 2
+            
+            tiles.append({
+                "tile_id": f"{i}_{j}",
+                "center": {
+                    "latitude": center_lat,
+                    "longitude": center_lon
+                },
+                "bounds": {
+                    "min_lat": tile_min_lat,
+                    "max_lat": tile_max_lat,
+                    "min_lon": tile_min_lon,
+                    "max_lon": tile_max_lon
+                }
+            })
+    
+    return tiles
+
+def generate_tiles_for_polygon(polygon, tile_size_km=0.5):
+    """
+    Generate grid tiles within a polygon geometry using coordinate-based calculations.
+    
+    Algorithm:
+    1. Calculate bounding box from polygon coordinates (for grid generation)
+    2. Generate uniform grid of tiles covering the bounding box
+    3. Filter tiles to only include those whose centers are inside the polygon
+    
+    All calculations are coordinate-based and direction-agnostic.
+    
+    Parameters:
+    - polygon: List of [latitude, longitude] pairs forming a closed polygon
+    - tile_size_km: Size of each tile in kilometers (default 0.5 km = 500m)
+    
+    Returns:
+    - List of tile dictionaries with center coordinates and bounds
+    """
+    if not polygon or len(polygon) < 3:
+        return []
+    
+    # Get bounding box from polygon (coordinate-based)
+    bounds = get_polygon_bounds(polygon)
+    if not bounds:
+        return []
+    
+    min_lat = bounds["min_lat"]
+    max_lat = bounds["max_lat"]
+    min_lon = bounds["min_lon"]
+    max_lon = bounds["max_lon"]
+    
+    # Generate grid tiles covering the bounding box (coordinate-based)
+    all_tiles = generate_tiles_from_bounds(min_lat, max_lat, min_lon, max_lon, tile_size_km)
+    
+    # Filter tiles to only include those whose centers are inside the polygon
+    filtered_tiles = []
+    for tile in all_tiles:
+        center_lat = tile["center"]["latitude"]
+        center_lon = tile["center"]["longitude"]
+        
+        # Only include tiles whose centers are inside the polygon
+        if point_in_polygon(center_lat, center_lon, polygon):
+            filtered_tiles.append(tile)
+    
+    return filtered_tiles
+
+
 def get_relative_humidity(latitude, longitude, target_datetime):
     """
     Fetch relative humidity from weather API for a specific datetime
@@ -82,47 +296,107 @@ def get_relative_humidity(latitude, longitude, target_datetime):
                 dt = dt.replace(tzinfo=timezone.utc)
         
         date_str = dt.strftime('%Y-%m-%d')
-        hour = dt.hour
         
-        # Fetch weather data from Weather API
-        base_url = "http://api.weatherapi.com/v1/forecast.json"
+        url = "https://api.open-meteo.com/v1/forecast"
         params = {
-            "key": WEATHER_API_KEY,
-            "q": f"{latitude},{longitude}",
-            "days": 2,  # Get today and tomorrow for forecast
-            "aqi": "no",
-            "alerts": "no"
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": ["relative_humidity_2m"],
+            "start_date": date_str,
+            "end_date": date_str,
+            "timezone": "auto"
         }
         
-        response = retry_session.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
+        # For today, request tomorrow too to get full forecast (same as weather/hourly)
+        today = datetime.now().date()
+        is_today = False
+        try:
+            request_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            is_today = request_date == today
+            if is_today:
+                tomorrow = (request_date + timedelta(days=1)).strftime('%Y-%m-%d')
+                params["end_date"] = tomorrow
+        except ValueError:
+            pass
         
-        if "forecast" not in data or "forecastday" not in data["forecast"]:
+        responses = openmeteo.weather_api(url, params=params)
+        
+        if not responses:
             return None
         
-        # Find the matching date and hour
-        target_date_obj = dt.date()
-        for forecast_day in data["forecast"]["forecastday"]:
-            day_date = datetime.strptime(forecast_day.get("date"), "%Y-%m-%d").date()
-            if day_date == target_date_obj and "hour" in forecast_day:
-                # Find the matching hour
-                for hour_data in forecast_day["hour"]:
-                    hour_time_str = hour_data.get("time")
-                    hour_dt = datetime.strptime(hour_time_str, "%Y-%m-%d %H:%M")
-                    if hour_dt.hour == hour:
-                        return hour_data.get("humidity")
+        response = responses[0]
+        hourly = response.Hourly()
+        hourly_humidity = hourly.Variables(0).ValuesAsNumpy()
         
-        # If exact hour not found, return average humidity for the day
-        for forecast_day in data["forecast"]["forecastday"]:
-            day_date = datetime.strptime(forecast_day.get("date"), "%Y-%m-%d").date()
-            if day_date == target_date_obj:
-                day_data = forecast_day.get("day", {})
-                return day_data.get("avghumidity")
+        # Get hourly times - use same logic as weather/hourly endpoint
+        try:
+            start_time = float(hourly.Time())
+            num_values = len(hourly_humidity)
+            try:
+                interval = float(hourly.Interval())
+            except (AttributeError, TypeError, ValueError):
+                interval = 3600  # Default to 1 hour
+            hourly_times = [start_time + (i * interval) for i in range(num_values)]
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.error(f"Error getting hourly times: {str(e)}")
+            try:
+                hourly_times_array = hourly.Time()
+                if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
+                    hourly_times = list(hourly_times_array)
+                else:
+                    hourly_times = []
+            except Exception as e2:
+                logger.error(f"Error in fallback time parsing: {str(e2)}")
+                hourly_times = []
         
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching relative humidity: {str(e)}")
+        # Match exact hour - use same logic as weather/hourly endpoint
+        # Normalize target datetime to hour boundary (minute=0, second=0, microsecond=0)
+        target_hour = dt.replace(minute=0, second=0, microsecond=0)
+        target_hour_timestamp = target_hour.timestamp()
+        
+        # Find exact match by comparing timestamps (within 1 second tolerance for rounding)
+        # This ensures we get the exact same humidity that weather/hourly would return
+        for i in range(len(hourly_times)):
+            try:
+                hour_timestamp = float(hourly_times[i])
+                hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
+                
+                # Match exact hour by comparing timestamps (within 1 second tolerance)
+                # Also verify date/hour components match as double-check
+                timestamp_diff = abs(hour_timestamp - target_hour_timestamp)
+                if (timestamp_diff <= 1.0 and  # Within 1 second
+                    hour_datetime.year == target_hour.year and
+                    hour_datetime.month == target_hour.month and
+                    hour_datetime.day == target_hour.day and
+                    hour_datetime.hour == target_hour.hour):
+                    if i < len(hourly_humidity):
+                        rh_value = float(hourly_humidity[i])
+                        if rh_value != rh_value:  # NaN check
+                            return None
+                        return rh_value
+            except (TypeError, ValueError, OSError):
+                continue
+        
+        # Fallback: find closest match within 1 hour (should rarely be needed)
+        closest_index = -1
+        min_diff = float('inf')
+        for i, hour_timestamp in enumerate(hourly_times):
+            try:
+                hour_ts = float(hour_timestamp)
+                diff = abs(hour_ts - target_hour_timestamp)
+                # Only consider matches within 1 hour
+                if diff < 3600 and diff < min_diff:
+                    min_diff = diff
+                    closest_index = i
+            except (TypeError, ValueError):
+                continue
+        
+        if closest_index >= 0 and closest_index < len(hourly_humidity):
+            rh_value = float(hourly_humidity[closest_index])
+            if rh_value != rh_value:  # NaN check
+                return None
+            return rh_value
+        
         return None
     except Exception as e:
         logger.error(f"Error fetching relative humidity: {str(e)}")
@@ -342,207 +616,11 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Setup the Weather API client with cache and retry on error
+# Setup the Open-Meteo API client with cache and retry on error
 # Reduced cache time to 5 minutes for more real-time data
 cache_session = requests_cache.CachedSession('.cache', expire_after=300)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-
-def fetch_weather_api_air_quality(latitude, longitude, date=None):
-    """
-    Fetch air quality data from Weather API
-    Returns: dict with air quality data or None if error
-    """
-    try:
-        if date:
-            # For historical data, try history endpoint (may not support AQI)
-            # Fallback to current if history doesn't work
-            base_url = "http://api.weatherapi.com/v1/history.json"
-            params = {
-                "key": WEATHER_API_KEY,
-                "q": f"{latitude},{longitude}",
-                "dt": date
-            }
-            try:
-                response = retry_session.get(base_url, params=params)
-                response.raise_for_status()
-                data = response.json()
-                # Historical data may not have air quality, so use forecast for AQI
-            except:
-                # If history fails, use current/forecast
-                date = None
-        
-        if not date:
-            # Current air quality data
-            base_url = "http://api.weatherapi.com/v1/airquality.json"
-            params = {
-                "key": WEATHER_API_KEY,
-                "q": f"{latitude},{longitude}"
-            }
-            response = retry_session.get(base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            if "current" in data:
-                aq = data["current"].get("air_quality", {})
-                return {
-                    "pm2_5": aq.get("pm2_5"),
-                    "pm10": aq.get("pm10"),
-                    "co": aq.get("co"),
-                    "no2": aq.get("no2"),
-                    "so2": aq.get("so2"),
-                    "o3": aq.get("o3"),
-                    "timestamp": data["current"].get("last_updated_epoch")
-                }
-        
-        # For date-specific or if current failed, try forecast
-        base_url = "http://api.weatherapi.com/v1/forecast.json"
-        params = {
-            "key": WEATHER_API_KEY,
-            "q": f"{latitude},{longitude}",
-            "days": 1,
-            "aqi": "yes",
-            "alerts": "no"
-        }
-        if date:
-            params["dt"] = date
-        
-        response = retry_session.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if "forecast" in data and "forecastday" in data["forecast"] and len(data["forecast"]["forecastday"]) > 0:
-            # Forecast data - return first day's average
-            forecast_day = data["forecast"]["forecastday"][0]
-            aq = forecast_day.get("day", {}).get("air_quality", {})
-            return {
-                "pm2_5": aq.get("pm2_5"),
-                "pm10": aq.get("pm10"),
-                "co": aq.get("co"),
-                "no2": aq.get("no2"),
-                "so2": aq.get("so2"),
-                "o3": aq.get("o3"),
-                "timestamp": forecast_day.get("date_epoch")
-            }
-        
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching air quality from Weather API: {str(e)}")
-        return None
-
-def fetch_weather_api_forecast_air_quality(latitude, longitude, start_date, end_date):
-    """
-    Fetch hourly air quality forecast data from Weather API
-    Returns: list of hourly records
-    """
-    try:
-        base_url = "http://api.weatherapi.com/v1/forecast.json"
-        params = {
-            "key": WEATHER_API_KEY,
-            "q": f"{latitude},{longitude}",
-            "days": 3,  # Weather API supports up to 3 days
-            "aqi": "yes",
-            "alerts": "no"
-        }
-        
-        # Weather API forecast returns up to 3 days, so we need to handle date ranges
-        response = retry_session.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        hourly_records = []
-        if "forecast" in data and "forecastday" in data["forecast"]:
-            for forecast_day in data["forecast"]["forecastday"]:
-                day_date = forecast_day.get("date")
-                day_obj = datetime.strptime(day_date, "%Y-%m-%d").date()
-                
-                # Check if this day is in our requested range
-                start_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
-                end_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-                
-                if start_obj <= day_obj <= end_obj:
-                    if "hour" in forecast_day:
-                        for hour_data in forecast_day["hour"]:
-                            aq = hour_data.get("air_quality", {})
-                            hour_time_str = hour_data.get("time")
-                            # Parse timestamp - Weather API returns in local time, convert to UTC
-                            try:
-                                hour_dt = datetime.strptime(hour_time_str, "%Y-%m-%d %H:%M")
-                                # Weather API returns local time, but we need UTC
-                                # For simplicity, treat as UTC (may need timezone conversion based on location)
-                                timestamp = hour_dt.replace(tzinfo=timezone.utc).timestamp()
-                            except ValueError:
-                                continue
-                            
-                            hourly_records.append({
-                                "timestamp": timestamp,
-                                "pm2_5": aq.get("pm2_5"),
-                                "pm10": aq.get("pm10"),
-                                "co": aq.get("co"),
-                                "no2": aq.get("no2"),
-                                "so2": aq.get("so2"),
-                                "o3": aq.get("o3")
-                            })
-        
-        return hourly_records
-    except Exception as e:
-        logger.error(f"Error fetching forecast air quality from Weather API: {str(e)}")
-        return []
-
-def fetch_weather_api_weather(latitude, longitude, date=None):
-    """
-    Fetch weather data from Weather API
-    Returns: dict with weather data or None if error
-    """
-    try:
-        if date:
-            # Historical data
-            base_url = "http://api.weatherapi.com/v1/history.json"
-            params = {
-                "key": WEATHER_API_KEY,
-                "q": f"{latitude},{longitude}",
-                "dt": date
-            }
-        else:
-            # Current/forecast data
-            base_url = "http://api.weatherapi.com/v1/forecast.json"
-            params = {
-                "key": WEATHER_API_KEY,
-                "q": f"{latitude},{longitude}",
-                "days": 1,
-                "aqi": "no",
-                "alerts": "no"
-            }
-        
-        response = retry_session.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        
-        if "current" in data:
-            current = data["current"]
-            return {
-                "temperature": current.get("temp_c"),
-                "humidity": current.get("humidity"),
-                "wind_speed": current.get("wind_kph") / 3.6,  # Convert km/h to m/s
-                "uv_index": current.get("uv"),
-                "weather_code": current.get("condition", {}).get("code"),
-                "timestamp": current.get("last_updated_epoch")
-            }
-        elif "forecast" in data and "forecastday" in data["forecast"]:
-            forecast_day = data["forecast"]["forecastday"][0]
-            day_data = forecast_day.get("day", {})
-            return {
-                "temperature_max": day_data.get("maxtemp_c"),
-                "temperature_min": day_data.get("mintemp_c"),
-                "humidity": day_data.get("avghumidity"),
-                "wind_speed": day_data.get("maxwind_kph") / 3.6,  # Convert km/h to m/s
-                "uv_index": day_data.get("uv"),
-                "weather_code": day_data.get("condition", {}).get("code"),
-                "timestamp": forecast_day.get("date_epoch")
-            }
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching weather from Weather API: {str(e)}")
-        return None
+openmeteo = openmeteo_requests.Client(session=retry_session)
 
 
 def calculate_aqi(pm25, pm10, o3=None, no2=None, so2=None, co=None):
@@ -697,7 +775,7 @@ def calculate_aqi(pm25, pm10, o3=None, no2=None, so2=None, co=None):
 @app.route('/api/aqi', methods=['POST'])
 def get_aqi():
     """
-    Get Air Quality Index data from Weather API
+    Get Air Quality Index data from Open-Meteo
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     """
     try:
@@ -709,6 +787,36 @@ def get_aqi():
         if not latitude or not longitude:
             return jsonify({'error': 'Latitude and longitude are required'}), 400
         
+        # Parse date if provided
+        start_date = None
+        end_date = None
+        if date:
+            try:
+                date_obj = datetime.strptime(date, '%Y-%m-%d')
+                start_date = date_obj.strftime('%Y-%m-%d')
+                end_date = date_obj.strftime('%Y-%m-%d')
+            except ValueError:
+                return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+        
+        url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
+                      "sulphur_dioxide", "ozone"],
+        }
+        
+        if start_date and end_date:
+            params["start_date"] = start_date
+            params["end_date"] = end_date
+        
+        responses = openmeteo.weather_api(url, params=params)
+        
+        if not responses:
+            return jsonify({'error': 'No data available for the specified location'}), 404
+        
+        response = responses[0]
+        
         # Check if this is a historical date (before today)
         today = datetime.now().date()
         is_historical = False
@@ -717,22 +825,37 @@ def get_aqi():
                 request_date = datetime.strptime(date, '%Y-%m-%d').date()
                 is_historical = request_date < today
             except ValueError:
-                return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
-        
-        # Fetch air quality data from Weather API
-        aq_data = fetch_weather_api_air_quality(latitude, longitude, date)
-        
-        if not aq_data:
-            return jsonify({'error': 'No data available for the specified location'}), 404
+                is_historical = False
         
         if is_historical:
-            # For historical dates, use the daily average data
-            avg_pm10 = aq_data.get("pm10")
-            avg_pm2_5 = aq_data.get("pm2_5")
-            avg_carbon_monoxide = aq_data.get("co")
-            avg_nitrogen_dioxide = aq_data.get("no2")
-            avg_sulphur_dioxide = aq_data.get("so2")
-            avg_ozone = aq_data.get("o3")
+            # For historical dates, use hourly data and calculate daily average
+            hourly = response.Hourly()
+            hourly_pm10 = hourly.Variables(0).ValuesAsNumpy()
+            hourly_pm2_5 = hourly.Variables(1).ValuesAsNumpy()
+            hourly_carbon_monoxide = hourly.Variables(2).ValuesAsNumpy()
+            hourly_nitrogen_dioxide = hourly.Variables(3).ValuesAsNumpy()
+            hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
+            hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
+            
+            # Calculate daily averages (handle empty arrays and NaN values)
+            def safe_mean(arr):
+                if len(arr) == 0:
+                    return None
+                try:
+                    mean_val = float(arr.mean())
+                    # Check for NaN
+                    if mean_val != mean_val:  # NaN check
+                        return None
+                    return mean_val
+                except (ValueError, TypeError, AttributeError):
+                    return None
+            
+            avg_pm10 = safe_mean(hourly_pm10)
+            avg_pm2_5 = safe_mean(hourly_pm2_5)
+            avg_carbon_monoxide = safe_mean(hourly_carbon_monoxide)
+            avg_nitrogen_dioxide = safe_mean(hourly_nitrogen_dioxide)
+            avg_sulphur_dioxide = safe_mean(hourly_sulphur_dioxide)
+            avg_ozone = safe_mean(hourly_ozone)
             
             # Calculate AQI from averages (including all pollutants)
             aqi = calculate_aqi(
@@ -801,70 +924,128 @@ def get_aqi():
                 }
             }
         else:
-            # For current date, fetch hourly forecast data and get the most recent complete hour
-            now = datetime.now(timezone.utc)
-            current_hour = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+            # For current date, use hourly data and get the most recent complete hour
+            # Initialize hour_datetime to current time as fallback
+            now_init = datetime.now(timezone.utc)
+            current_hour_init = now_init.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+            hour_datetime = current_hour_init
             
-            # Fetch hourly forecast data from Weather API
-            hourly_records = fetch_weather_api_forecast_air_quality(
-                latitude, longitude, 
-                today.strftime('%Y-%m-%d'), 
-                (today + timedelta(days=1)).strftime('%Y-%m-%d')
-            )
+            hourly = response.Hourly()
+            hourly_pm10 = hourly.Variables(0).ValuesAsNumpy()
+            hourly_pm2_5 = hourly.Variables(1).ValuesAsNumpy()
+            hourly_carbon_monoxide = hourly.Variables(2).ValuesAsNumpy()
+            hourly_nitrogen_dioxide = hourly.Variables(3).ValuesAsNumpy()
+            hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
+            hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
             
-            # Find the most recent complete hour
-            def safe_float(value):
-                if value is None:
-                    return None
+            # Get hourly times - Open-Meteo returns Unix timestamps in seconds
+            # hourly.Time() might return a single start timestamp or an array
+            # We'll calculate timestamps from start time and interval if needed
+            try:
+                start_time = float(hourly.Time())
+                num_values = len(hourly_pm10)
+                
+                # Try to get interval, default to 3600 seconds (1 hour) if not available
                 try:
-                    val = float(value)
-                    if val != val:  # NaN check
-                        return None
-                    return val
-                except (TypeError, ValueError):
-                    return None
-            
-            # Find the hour record closest to current_hour
-            hour_datetime = current_hour
-            pm10 = None
-            pm2_5 = None
-            carbon_monoxide = None
-            nitrogen_dioxide = None
-            sulphur_dioxide = None
-            ozone = None
-            
-            if hourly_records:
-                current_hour_timestamp = current_hour.timestamp()
-                closest_record = None
-                min_diff = float('inf')
+                    interval = float(hourly.Interval())  # Interval in seconds
+                except (AttributeError, TypeError, ValueError):
+                    interval = 3600  # Default to 1 hour
                 
-                for record in hourly_records:
-                    record_timestamp = record.get("timestamp")
-                    if record_timestamp:
-                        diff = abs(record_timestamp - current_hour_timestamp)
-                        if record_timestamp <= current_hour_timestamp and diff < min_diff:
-                            min_diff = diff
-                            closest_record = record
+                # Calculate all timestamps from start time and interval
+                hourly_times = [start_time + (i * interval) for i in range(num_values)]
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.error(f"Error getting hourly times: {str(e)}")
+                # Fallback: try to get as array
+                try:
+                    hourly_times_array = hourly.Time()
+                    if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
+                        hourly_times = list(hourly_times_array)
+                    else:
+                        hourly_times = []
+                except Exception as e2:
+                    logger.error(f"Error in fallback time parsing: {str(e2)}")
+                    hourly_times = []
+            
+            # Get current time and find the most recent complete hour
+            now = datetime.now(timezone.utc)
+            # Get the most recent complete hour (subtract 1 hour from current hour)
+            current_hour = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+            current_hour_timestamp = current_hour.timestamp()
+            
+            # Find the index of the most recent complete hour (not current or future)
+            latest_index = -1
+            if len(hourly_times) > 0:
+                # Iterate backwards to find the most recent hour <= current_hour
+                for i in range(len(hourly_times) - 1, -1, -1):
+                    try:
+                        # hourly.Time() returns Unix timestamps in seconds
+                        hour_timestamp = float(hourly_times[i])
+                        hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
+                        
+                        # Use the most recent hour that is <= current_hour (most recent complete hour)
+                        if hour_timestamp <= current_hour_timestamp:
+                            latest_index = i
+                            break
+                    except (IndexError, TypeError, ValueError, OSError) as e:
+                        logger.error(f"Error parsing hour time at index {i}: {str(e)}")
+                        continue
+            
+            # If no valid hour found, use the last available (simpler fallback)
+            if latest_index == -1:
+                if len(hourly_pm10) > 0:
+                    latest_index = len(hourly_pm10) - 1
+                else:
+                    latest_index = -1
+            
+            # Get values for the most recent complete hour
+            if latest_index >= 0 and latest_index < len(hourly_pm10):
+                try:
+                    def safe_float(value):
+                        if value is None:
+                            return None
+                        try:
+                            val = float(value)
+                            # Check for NaN
+                            if val != val:  # NaN check
+                                return None
+                            return val
+                        except (TypeError, ValueError):
+                            return None
+                    
+                    pm10 = safe_float(hourly_pm10[latest_index])
+                    pm2_5 = safe_float(hourly_pm2_5[latest_index])
+                    carbon_monoxide = safe_float(hourly_carbon_monoxide[latest_index])
+                    nitrogen_dioxide = safe_float(hourly_nitrogen_dioxide[latest_index])
+                    sulphur_dioxide = safe_float(hourly_sulphur_dioxide[latest_index])
+                    ozone = safe_float(hourly_ozone[latest_index])
+                except (IndexError, TypeError, ValueError) as e:
+                    logger.error(f"Error accessing hourly AQI data at index {latest_index}: {str(e)}")
+                    pm10 = None
+                    pm2_5 = None
+                    carbon_monoxide = None
+                    nitrogen_dioxide = None
+                    sulphur_dioxide = None
+                    ozone = None
                 
-                if closest_record:
-                    pm10 = safe_float(closest_record.get("pm10"))
-                    pm2_5 = safe_float(closest_record.get("pm2_5"))
-                    carbon_monoxide = safe_float(closest_record.get("co"))
-                    nitrogen_dioxide = safe_float(closest_record.get("no2"))
-                    sulphur_dioxide = safe_float(closest_record.get("so2"))
-                    ozone = safe_float(closest_record.get("o3"))
-                    hour_datetime = datetime.fromtimestamp(closest_record.get("timestamp"), tz=timezone.utc)
-                elif len(hourly_records) > 0:
-                    # Fallback to most recent record
-                    latest_record = hourly_records[-1]
-                    pm10 = safe_float(latest_record.get("pm10"))
-                    pm2_5 = safe_float(latest_record.get("pm2_5"))
-                    carbon_monoxide = safe_float(latest_record.get("co"))
-                    nitrogen_dioxide = safe_float(latest_record.get("no2"))
-                    sulphur_dioxide = safe_float(latest_record.get("so2"))
-                    ozone = safe_float(latest_record.get("o3"))
-                    if latest_record.get("timestamp"):
-                        hour_datetime = datetime.fromtimestamp(latest_record.get("timestamp"), tz=timezone.utc)
+                # Get the timestamp for this hour
+                try:
+                    if latest_index < len(hourly_times):
+                        # hourly.Time() returns Unix timestamps in seconds
+                        hour_timestamp = float(hourly_times[latest_index])
+                        hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
+                    else:
+                        hour_datetime = current_hour
+                except (IndexError, TypeError, ValueError, OSError):
+                    hour_datetime = current_hour
+            else:
+                # Fallback if no data available
+                pm10 = None
+                pm2_5 = None
+                carbon_monoxide = None
+                nitrogen_dioxide = None
+                sulphur_dioxide = None
+                ozone = None
+                hour_datetime = current_hour
             
             # Calculate AQI (including all pollutants)
             aqi = calculate_aqi(
@@ -942,7 +1123,7 @@ def get_aqi():
 @app.route('/api/aqi/hourly', methods=['POST'])
 def get_aqi_hourly():
     """
-    Get hourly Air Quality Index data from Weather API for a specific date
+    Get hourly Air Quality Index data from Open-Meteo for a specific date
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     Returns: Array of hourly AQI records with trend indicators
     """
@@ -965,23 +1146,72 @@ def get_aqi_hourly():
         except ValueError:
             return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
         
+        url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+        params = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
+                      "sulphur_dioxide", "ozone"],
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        
         # For today, ensure we get forecast data by requesting up to tomorrow
         today = datetime.now().date()
         try:
             request_date = datetime.strptime(date, '%Y-%m-%d').date()
-            is_today = request_date == today
-            if is_today:
+            if request_date == today:
                 # Request data for today and tomorrow to get full forecast
                 tomorrow = (request_date + timedelta(days=1)).strftime('%Y-%m-%d')
-                end_date = tomorrow
+                params["end_date"] = tomorrow
         except ValueError:
-            is_today = False
+            pass
         
-        # Fetch hourly forecast data from Weather API
-        hourly_data = fetch_weather_api_forecast_air_quality(latitude, longitude, start_date, end_date)
+        responses = openmeteo.weather_api(url, params=params)
         
-        if not hourly_data:
+        if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
+        
+        response = responses[0]
+        hourly = response.Hourly()
+        hourly_pm10 = hourly.Variables(0).ValuesAsNumpy()
+        hourly_pm2_5 = hourly.Variables(1).ValuesAsNumpy()
+        hourly_carbon_monoxide = hourly.Variables(2).ValuesAsNumpy()
+        hourly_nitrogen_dioxide = hourly.Variables(3).ValuesAsNumpy()
+        hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
+        hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
+        
+        # Get hourly times
+        try:
+            start_time = float(hourly.Time())
+            num_values = len(hourly_pm10)
+            
+            try:
+                interval = float(hourly.Interval())
+            except (AttributeError, TypeError, ValueError):
+                interval = 3600  # Default to 1 hour
+            
+            hourly_times = [start_time + (i * interval) for i in range(num_values)]
+        except (AttributeError, TypeError, ValueError) as e:
+            logger.error(f"Error getting hourly times: {str(e)}")
+            try:
+                hourly_times_array = hourly.Time()
+                if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
+                    hourly_times = list(hourly_times_array)
+                else:
+                    hourly_times = []
+            except Exception as e2:
+                logger.error(f"Error in fallback time parsing: {str(e2)}")
+                hourly_times = []
+        
+        # Check if this is today
+        today = datetime.now().date()
+        is_today = False
+        try:
+            request_date = datetime.strptime(date, '%Y-%m-%d').date()
+            is_today = request_date == today
+        except ValueError:
+            pass
         
         # Get current time for today (in UTC)
         now = datetime.now(timezone.utc)
@@ -1008,13 +1238,13 @@ def get_aqi_hourly():
         requested_date_start = datetime.combine(requested_date_obj, datetime.min.time()).replace(tzinfo=timezone.utc)
         requested_date_end = requested_date_start + timedelta(days=1)
         
-        for record in hourly_data:
+        for i in range(len(hourly_pm10)):
             try:
-                hour_timestamp = record.get("timestamp")
-                if not hour_timestamp:
+                hour_timestamp = float(hourly_times[i]) if i < len(hourly_times) else None
+                if hour_timestamp:
+                    hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
+                else:
                     continue
-                
-                hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
                 
                 # Only include hours that belong to the requested date
                 # Check if hour is within the requested date range (00:00 to 23:59 of that date)
@@ -1023,12 +1253,12 @@ def get_aqi_hourly():
                 
                 # Show all hours for the requested date (including forecast for today)
                 
-                pm10 = safe_float(record.get("pm10"))
-                pm2_5 = safe_float(record.get("pm2_5"))
-                carbon_monoxide = safe_float(record.get("co"))
-                nitrogen_dioxide = safe_float(record.get("no2"))
-                sulphur_dioxide = safe_float(record.get("so2"))
-                ozone = safe_float(record.get("o3"))
+                pm10 = safe_float(hourly_pm10[i])
+                pm2_5 = safe_float(hourly_pm2_5[i])
+                carbon_monoxide = safe_float(hourly_carbon_monoxide[i])
+                nitrogen_dioxide = safe_float(hourly_nitrogen_dioxide[i])
+                sulphur_dioxide = safe_float(hourly_sulphur_dioxide[i])
+                ozone = safe_float(hourly_ozone[i])
                 
                 # Calculate AQI for this hour
                 aqi = calculate_aqi(
@@ -1176,143 +1406,178 @@ def get_aqi_hourly_range():
         except ValueError:
             return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
         
-        # Fetch data for the entire date range using Weather API
-        # Weather API supports up to 3 days, so we may need to make multiple requests
+        # Fetch data for each date in the range
         all_hourly_records = []
         current_date = start_date_obj
-        today = datetime.now().date()
         
-        # Calculate the end date for forecast (include tomorrow if today is in range)
-        forecast_end_date = end_date_obj
-        if today >= start_date_obj and today <= end_date_obj:
-            forecast_end_date = min(end_date_obj, today + timedelta(days=2))
-        
-        # Fetch hourly forecast data for the range
-        hourly_data = fetch_weather_api_forecast_air_quality(
-            latitude, longitude,
-            start_date_obj.strftime('%Y-%m-%d'),
-            forecast_end_date.strftime('%Y-%m-%d')
-        )
-        
-        def safe_float(value):
-            if value is None:
-                return None
+        while current_date <= end_date_obj:
+            date_str = current_date.strftime('%Y-%m-%d')
+            
+            # Use the existing hourly endpoint logic
+            url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+            params = {
+                "latitude": latitude,
+                "longitude": longitude,
+                "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
+                          "sulphur_dioxide", "ozone"],
+                "start_date": date_str,
+                "end_date": date_str,
+            }
+            
+            # For today, request tomorrow too to get full forecast
+            today = datetime.now().date()
+            if current_date.date() == today:
+                tomorrow = (current_date.date() + timedelta(days=1)).strftime('%Y-%m-%d')
+                params["end_date"] = tomorrow
+            
             try:
-                val = float(value)
-                if val != val:
-                    return None
-                return val
-            except (TypeError, ValueError):
-                return None
-        
-        # Process all hourly records and filter by date range
-        now = datetime.now(timezone.utc)
-        current_time_timestamp = now.timestamp()
-        
-        for record in hourly_data:
-            try:
-                hour_timestamp = record.get("timestamp")
-                if not hour_timestamp:
-                    continue
-                
-                hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
-                hour_date = hour_datetime.date()
-                
-                # Check if this hour is within the requested date range
-                if hour_date < start_date_obj or hour_date > end_date_obj:
-                    continue
-                
-                requested_date_start = datetime.combine(hour_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-                requested_date_end = requested_date_start + timedelta(days=1)
-                
-                if hour_datetime < requested_date_start or hour_datetime >= requested_date_end:
-                    continue
-                
-                is_today = hour_date == today
-                
-                pm10 = safe_float(record.get("pm10"))
-                pm2_5 = safe_float(record.get("pm2_5"))
-                carbon_monoxide = safe_float(record.get("co"))
-                nitrogen_dioxide = safe_float(record.get("no2"))
-                sulphur_dioxide = safe_float(record.get("so2"))
-                ozone = safe_float(record.get("o3"))
-                
-                aqi = calculate_aqi(
-                    pm25=pm2_5,
-                    pm10=pm10,
-                    o3=ozone,
-                    no2=nitrogen_dioxide,
-                    so2=sulphur_dioxide,
-                    co=carbon_monoxide
-                )
-                
-                data_source = "History/Estimate"
-                if is_today:
-                    if hour_timestamp < current_time_timestamp:
-                        data_source = "History/Estimate"
-                    else:
-                        data_source = "Prediction"
-                
-                # Calculate correction factor for this specific hour
-                # Pass the datetime object directly to ensure exact matching
-                hour_datetime_str = hour_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                cf_data = calculate_correction_factor(latitude, longitude, hour_datetime)
-                cf = cf_data["cf"]
-                
-                # Calculate corrected values
-                pm10_0to3m = round(pm10 * cf, 2) if pm10 is not None else None
-                pm2_5_0to3m = round(pm2_5 * cf, 2) if pm2_5 is not None else None
-                co_0to3m = round(carbon_monoxide * cf, 2) if carbon_monoxide is not None else None
-                no2_0to3m = round(nitrogen_dioxide * cf, 2) if nitrogen_dioxide is not None else None
-                so2_0to3m = round(sulphur_dioxide * cf, 2) if sulphur_dioxide is not None else None
-                o3_0to3m = round(ozone * cf, 2) if ozone is not None else None
-                aqi_corrected = calculate_aqi(
-                    pm25=pm2_5_0to3m,
-                    pm10=pm10_0to3m,
-                    o3=o3_0to3m,
-                    no2=no2_0to3m,
-                    so2=so2_0to3m,
-                    co=co_0to3m
-                )
-                aqi_corrected = int(aqi_corrected) if aqi_corrected is not None else None
+                responses = openmeteo.weather_api(url, params=params)
+                if responses:
+                    response = responses[0]
+                    hourly = response.Hourly()
+                    hourly_pm10 = hourly.Variables(0).ValuesAsNumpy()
+                    hourly_pm2_5 = hourly.Variables(1).ValuesAsNumpy()
+                    hourly_carbon_monoxide = hourly.Variables(2).ValuesAsNumpy()
+                    hourly_nitrogen_dioxide = hourly.Variables(3).ValuesAsNumpy()
+                    hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
+                    hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
+                    
+                    # Get hourly times
+                    try:
+                        start_time = float(hourly.Time())
+                        num_values = len(hourly_pm10)
+                        try:
+                            interval = float(hourly.Interval())
+                        except (AttributeError, TypeError, ValueError):
+                            interval = 3600
+                        hourly_times = [start_time + (i * interval) for i in range(num_values)]
+                    except (AttributeError, TypeError, ValueError):
+                        try:
+                            hourly_times_array = hourly.Time()
+                            if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
+                                hourly_times = list(hourly_times_array)
+                            else:
+                                hourly_times = []
+                        except Exception:
+                            hourly_times = []
+                    
+                    # Process hours for this date
+                    now = datetime.now(timezone.utc)
+                    current_time_timestamp = now.timestamp()
+                    requested_date_obj = current_date.date()
+                    requested_date_start = datetime.combine(requested_date_obj, datetime.min.time()).replace(tzinfo=timezone.utc)
+                    requested_date_end = requested_date_start + timedelta(days=1)
+                    is_today = requested_date_obj == today
+                    
+                    def safe_float(value):
+                        if value is None:
+                            return None
+                        try:
+                            val = float(value)
+                            if val != val:
+                                return None
+                            return val
+                        except (TypeError, ValueError):
+                            return None
+                    
+                    for i in range(len(hourly_pm10)):
+                        try:
+                            hour_timestamp = float(hourly_times[i]) if i < len(hourly_times) else None
+                            if hour_timestamp:
+                                hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
+                            else:
+                                continue
+                            
+                            if hour_datetime < requested_date_start or hour_datetime >= requested_date_end:
+                                continue
+                            
+                            pm10 = safe_float(hourly_pm10[i])
+                            pm2_5 = safe_float(hourly_pm2_5[i])
+                            carbon_monoxide = safe_float(hourly_carbon_monoxide[i])
+                            nitrogen_dioxide = safe_float(hourly_nitrogen_dioxide[i])
+                            sulphur_dioxide = safe_float(hourly_sulphur_dioxide[i])
+                            ozone = safe_float(hourly_ozone[i])
+                            
+                            aqi = calculate_aqi(
+                                pm25=pm2_5,
+                                pm10=pm10,
+                                o3=ozone,
+                                no2=nitrogen_dioxide,
+                                so2=sulphur_dioxide,
+                                co=carbon_monoxide
+                            )
+                            
+                            data_source = "History/Estimate"
+                            if is_today:
+                                if hour_timestamp < current_time_timestamp:
+                                    data_source = "History/Estimate"
+                                else:
+                                    data_source = "Prediction"
+                            
+                            # Calculate correction factor for this specific hour
+                            # Pass the datetime object directly to ensure exact matching
+                            hour_datetime_str = hour_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                            cf_data = calculate_correction_factor(latitude, longitude, hour_datetime)
+                            cf = cf_data["cf"]
+                            
+                            # Calculate corrected values
+                            pm10_0to3m = round(pm10 * cf, 2) if pm10 is not None else None
+                            pm2_5_0to3m = round(pm2_5 * cf, 2) if pm2_5 is not None else None
+                            co_0to3m = round(carbon_monoxide * cf, 2) if carbon_monoxide is not None else None
+                            no2_0to3m = round(nitrogen_dioxide * cf, 2) if nitrogen_dioxide is not None else None
+                            so2_0to3m = round(sulphur_dioxide * cf, 2) if sulphur_dioxide is not None else None
+                            o3_0to3m = round(ozone * cf, 2) if ozone is not None else None
+                            aqi_corrected = calculate_aqi(
+                                pm25=pm2_5_0to3m,
+                                pm10=pm10_0to3m,
+                                o3=o3_0to3m,
+                                no2=no2_0to3m,
+                                so2=so2_0to3m,
+                                co=co_0to3m
+                            )
+                            aqi_corrected = int(aqi_corrected) if aqi_corrected is not None else None
 
-                # Calculate corrected AQI by multiplying raw AQI with correction factor
-                aqi_0to3m = round(aqi * cf, 2) if aqi is not None else None
-                
-                record = {
-                    "date": hour_datetime_str,
-                    "pm10": round(pm10, 2) if pm10 is not None else None,
-                    "pm2_5": round(pm2_5, 2) if pm2_5 is not None else None,
-                    "co": round(carbon_monoxide, 2) if carbon_monoxide is not None else None,
-                    "no2": round(nitrogen_dioxide, 2) if nitrogen_dioxide is not None else None,
-                    "so2": round(sulphur_dioxide, 2) if sulphur_dioxide is not None else None,
-                    "o3": round(ozone, 2) if ozone is not None else None,
-                    "aqi": int(aqi) if aqi is not None else None,
-                    "data_source": data_source,
-                    # Corrected values
-                    "aqi_corrected": aqi_corrected,
-                    "aqi_0to3m": int(aqi_0to3m) if aqi_0to3m is not None else None,
-                    "pm10_0to3m": pm10_0to3m,
-                    "pm2_5_0to3m": pm2_5_0to3m,
-                    "co_0to3m": co_0to3m,
-                    "no2_0to3m": no2_0to3m,
-                    "so2_0to3m": so2_0to3m,
-                    "o3_0to3m": o3_0to3m,
-                    # Correction factor details
-                    "correction_factor": {
-                        "cf": cf,
-                        "vpc": cf_data["vpc"],
-                        "tdc": cf_data["tdc"],
-                        "lsaf": cf_data["lsaf"],
-                        "hcf": cf_data["hcf"],
-                        "rh": cf_data["rh"]
-                    }
-                }
-                
-                all_hourly_records.append(record)
+                            # Calculate corrected AQI by multiplying raw AQI with correction factor
+                            aqi_0to3m = round(aqi * cf, 2) if aqi is not None else None
+                            
+                            record = {
+                                "date": hour_datetime_str,
+                                "pm10": round(pm10, 2) if pm10 is not None else None,
+                                "pm2_5": round(pm2_5, 2) if pm2_5 is not None else None,
+                                "co": round(carbon_monoxide, 2) if carbon_monoxide is not None else None,
+                                "no2": round(nitrogen_dioxide, 2) if nitrogen_dioxide is not None else None,
+                                "so2": round(sulphur_dioxide, 2) if sulphur_dioxide is not None else None,
+                                "o3": round(ozone, 2) if ozone is not None else None,
+                                "aqi": int(aqi) if aqi is not None else None,
+                                "data_source": data_source,
+                                # Corrected values
+                                "aqi_corrected": aqi_corrected,
+                                "aqi_0to3m": int(aqi_0to3m) if aqi_0to3m is not None else None,
+                                "pm10_0to3m": pm10_0to3m,
+                                "pm2_5_0to3m": pm2_5_0to3m,
+                                "co_0to3m": co_0to3m,
+                                "no2_0to3m": no2_0to3m,
+                                "so2_0to3m": so2_0to3m,
+                                "o3_0to3m": o3_0to3m,
+                                # Correction factor details
+                                "correction_factor": {
+                                    "cf": cf,
+                                    "vpc": cf_data["vpc"],
+                                    "tdc": cf_data["tdc"],
+                                    "lsaf": cf_data["lsaf"],
+                                    "hcf": cf_data["hcf"],
+                                    "rh": cf_data["rh"]
+                                }
+                            }
+                            
+                            all_hourly_records.append(record)
+                        except Exception:
+                            continue
             except Exception as e:
-                logger.error(f"Error processing hourly record: {str(e)}")
+                logger.error(f"Error fetching data for {date_str}: {str(e)}")
                 continue
+            
+            current_date += timedelta(days=1)
         
         return jsonify({
             "start_date": start_date,
@@ -1334,9 +1599,7 @@ def get_aqi_hourly_range():
 @app.route('/api/weather', methods=['POST'])
 def get_weather():
     """
-    Get Weather data from Weather API
-    Note: This endpoint still uses OpenMeteo structure for data processing.
-    The get_relative_humidity function (used in AQI calculation) has been updated to use Weather API.
+    Get Weather data from Open-Meteo
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     """
     try:
@@ -1388,12 +1651,7 @@ def get_weather():
             except ValueError:
                 return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
         
-        # Note: Still using OpenMeteo for weather endpoint as it requires significant refactoring
-        # The AQI endpoints have been fully migrated to Weather API
-        # Import openmeteo_requests temporarily for weather endpoint only
-        import openmeteo_requests
-        openmeteo_temp = openmeteo_requests.Client(session=retry_session)
-        responses = openmeteo_temp.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params=params)
         
         if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
@@ -2121,6 +2379,313 @@ def analyze_aqi_with_llm():
             "details": str(e)
         }), 500
 
+@app.route('/api/aqi/tiles', methods=['POST'])
+def get_aqi_tiles():
+    """
+    Get tile-based AQI data for a polygon area (geometry-based)
+    
+    Accepts either:
+    1. Polygon geometry (preferred):
+    {
+        "polygon": [
+            [lat1, lon1],
+            [lat2, lon2],
+            [lat3, lon3],
+            ...
+        ],
+        "start_date": "YYYY-MM-DD",
+        "end_date": "YYYY-MM-DD",
+        "tile_size_km": float (optional, default 0.5),
+        "use_0to3m": bool (optional, default True)
+    }
+    
+    Returns:
+    {
+        "tiles": [
+            {
+                "tile_id": str,
+                "center": {"latitude": float, "longitude": float},
+                "bounds": {"min_lat": float, "max_lat": float, "min_lon": float, "max_lon": float},
+                "aqi": int,
+                "aqi_0to3m": int,
+                "color": str (hex),
+                "category": str,
+                "label": str,
+                "pm2_5": float,
+                "pm10": float,
+                "pm2_5_0to3m": float,
+                "pm10_0to3m": float
+            }
+        ],
+        "summary": {
+            "total_tiles": int,
+            "avg_aqi": float,
+            "avg_aqi_0to3m": float,
+            "min_aqi": int,
+            "max_aqi": int
+        }
+    }
+    """
+    try:
+        data = request.get_json()
+        polygon = data.get('polygon')
+        start_date = data.get('start_date')
+        end_date = data.get('end_date')
+        tile_size_km = data.get('tile_size_km', 0.5)  # Default 500m tiles
+        
+        if not start_date or not end_date:
+            return jsonify({'error': 'Start date and end date are required'}), 400
+        
+        if not polygon:
+            return jsonify({'error': 'Polygon is required'}), 400
+        
+        if not isinstance(polygon, list) or len(polygon) < 3:
+            return jsonify({'error': 'Polygon must be a list of at least 3 [latitude, longitude] pairs'}), 400
+
+        # Validate polygon coordinates
+        for point in polygon:
+            if not isinstance(point, list) or len(point) != 2:
+                return jsonify({'error': 'Each polygon point must be [latitude, longitude]'}), 400
+            lat, lon = point
+            if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+                return jsonify({'error': 'Coordinates must be numbers'}), 400
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                return jsonify({'error': 'Invalid coordinates: lat must be -90 to 90, lon must be -180 to 180'}), 400
+        
+        # Generate tiles for polygon
+        tiles = generate_tiles_for_polygon(polygon, tile_size_km)
+        bounds_data = get_polygon_bounds(polygon)
+        
+        if len(tiles) > 1000:  # Limit to prevent excessive API calls
+            return jsonify({
+                'error': f'Too many tiles ({len(tiles)}). Please use a smaller area or larger tile size.',
+                'suggestion': f'Try tile_size_km >= {tile_size_km * (len(tiles) / 1000):.2f}'
+            }), 400
+        
+        # Calculate AQI for each tile
+        tile_results = []
+        aqi_values = []
+        tile_index = 0  # Initialize tile index for dummy AQI mapping
+        
+        # Use date range endpoint to get hourly data for date range
+        # For each tile, we'll calculate average AQI over the date range
+        for tile in tiles:
+            try:
+                center_lat = tile['center']['latitude']
+                center_lon = tile['center']['longitude']
+                
+                # Fetch hourly AQI data for the date range
+                url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+                params = {
+                    "latitude": center_lat,
+                    "longitude": center_lon,
+                    "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
+                              "sulphur_dioxide", "ozone"],
+                    "start_date": start_date,
+                    "end_date": end_date,
+                }
+                
+                # For today, request tomorrow too to get full forecast
+                today = datetime.now().date()
+                try:
+                    request_start = datetime.strptime(start_date, '%Y-%m-%d').date()
+                    request_end = datetime.strptime(end_date, '%Y-%m-%d').date()
+                    if request_start <= today <= request_end:
+                        tomorrow = (today + timedelta(days=1)).strftime('%Y-%m-%d')
+                        params["end_date"] = tomorrow
+                except ValueError:
+                    pass
+                
+                responses = openmeteo.weather_api(url, params=params)
+                
+                if not responses:
+                    # Skip tile if no data available
+                    continue
+                
+                response = responses[0]
+                hourly = response.Hourly()
+                hourly_pm10 = hourly.Variables(0).ValuesAsNumpy()
+                hourly_pm2_5 = hourly.Variables(1).ValuesAsNumpy()
+                hourly_carbon_monoxide = hourly.Variables(2).ValuesAsNumpy()
+                hourly_nitrogen_dioxide = hourly.Variables(3).ValuesAsNumpy()
+                hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
+                hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
+                
+                # Get hourly times
+                try:
+                    start_time = float(hourly.Time())
+                    num_values = len(hourly_pm10)
+                    try:
+                        interval = float(hourly.Interval())
+                    except (AttributeError, TypeError, ValueError):
+                        interval = 3600
+                    hourly_times = [start_time + (i * interval) for i in range(num_values)]
+                except (AttributeError, TypeError, ValueError):
+                    try:
+                        hourly_times_array = hourly.Time()
+                        if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
+                            hourly_times = list(hourly_times_array)
+                        else:
+                            hourly_times = []
+                    except Exception:
+                        hourly_times = []
+                
+                # Filter to date range and calculate averages
+                def safe_mean(arr):
+                    if len(arr) == 0:
+                        return None
+                    try:
+                        mean_val = float(arr.mean())
+                        if mean_val != mean_val:  # NaN check
+                            return None
+                        return mean_val
+                    except (ValueError, TypeError, AttributeError):
+                        return None
+                
+                # Filter hours within date range
+                start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
+                end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
+                start_datetime = datetime.combine(start_date_obj, datetime.min.time()).replace(tzinfo=timezone.utc)
+                end_datetime = datetime.combine(end_date_obj, datetime.min.time()).replace(tzinfo=timezone.utc) + timedelta(days=1)
+                
+                valid_pm10 = []
+                valid_pm2_5 = []
+                valid_co = []
+                valid_no2 = []
+                valid_so2 = []
+                valid_o3 = []
+                
+                for i in range(len(hourly_pm10)):
+                    try:
+                        hour_timestamp = float(hourly_times[i]) if i < len(hourly_times) else None
+                        if hour_timestamp:
+                            hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
+                            if start_datetime <= hour_datetime < end_datetime:
+                                pm10_val = float(hourly_pm10[i]) if hourly_pm10[i] is not None else None
+                                pm2_5_val = float(hourly_pm2_5[i]) if hourly_pm2_5[i] is not None else None
+                                co_val = float(hourly_carbon_monoxide[i]) if hourly_carbon_monoxide[i] is not None else None
+                                no2_val = float(hourly_nitrogen_dioxide[i]) if hourly_nitrogen_dioxide[i] is not None else None
+                                so2_val = float(hourly_sulphur_dioxide[i]) if hourly_sulphur_dioxide[i] is not None else None
+                                o3_val = float(hourly_ozone[i]) if hourly_ozone[i] is not None else None
+                                
+                                if pm10_val is not None and pm10_val == pm10_val:  # Not NaN
+                                    valid_pm10.append(pm10_val)
+                                if pm2_5_val is not None and pm2_5_val == pm2_5_val:
+                                    valid_pm2_5.append(pm2_5_val)
+                                if co_val is not None and co_val == co_val:
+                                    valid_co.append(co_val)
+                                if no2_val is not None and no2_val == no2_val:
+                                    valid_no2.append(no2_val)
+                                if so2_val is not None and so2_val == so2_val:
+                                    valid_so2.append(so2_val)
+                                if o3_val is not None and o3_val == o3_val:
+                                    valid_o3.append(o3_val)
+                    except (IndexError, TypeError, ValueError):
+                        continue
+                
+                # Calculate averages
+                def safe_mean(values):
+                    if not values:
+                        return None
+                    try:
+                        return sum(values) / len(values)
+                    except (TypeError, ValueError):
+                        return None
+                
+                avg_pm10 = safe_mean(valid_pm10)
+                avg_pm2_5 = safe_mean(valid_pm2_5)
+                avg_co = safe_mean(valid_co)
+                avg_no2 = safe_mean(valid_no2)
+                avg_so2 = safe_mean(valid_so2)
+                avg_o3 = safe_mean(valid_o3)
+                
+                # Calculate AQI at 10m height
+                # aqi = calculate_aqi(
+                #     pm25=avg_pm2_5,
+                #     pm10=avg_pm10,
+                #     o3=avg_o3,
+                #     no2=avg_no2,
+                #     so2=avg_so2,
+                #     co=avg_co
+                # )
+                
+                # ================= DUMMY AQI MAPPING (VISUAL TESTING ONLY) =================
+
+                DUMMY_AQI_GROUPS = [
+                    25, 25, 25,25,              # Good
+                    75, 75, 75, 75,             # Moderate
+                    110, 110, 110, 110,         # Poor
+                    155, 155, 155, 155,         # Unhealthy
+                    190, 190, 190,190,          # Unhealthy
+                    260, 260, 260, 260,         # Severe
+                    310, 310 ,310,310           # Hazardous
+                ]
+
+                aqi = DUMMY_AQI_GROUPS[tile_index % len(DUMMY_AQI_GROUPS)]
+                tile_index += 1
+                # =================================================================
+
+
+                if aqi is None:
+                    continue
+               
+                display_aqi = int(aqi)
+
+                # Get color for the display AQI
+                color_info = get_aqi_color(display_aqi)
+
+                tile_result = {
+                    "tile_id": tile["tile_id"],
+                    "center": tile["center"],
+                    "bounds": tile["bounds"],
+                    "aqi": int(aqi),                 # 10m AQI ONLY
+                    "aqi_0to3m": None,               # disabled
+                    "color": color_info["color"],
+                    "category": color_info["category"],
+                    "label": color_info["label"],
+                    "pm2_5": round(avg_pm2_5, 2) if avg_pm2_5 is not None else None,
+                    "pm10": round(avg_pm10, 2) if avg_pm10 is not None else None,
+                    "pm2_5_0to3m": None,             # disabled
+                    "pm10_0to3m": None,              # disabled
+                    "correction_factor": None        # disabled
+                }
+
+                
+                tile_results.append(tile_result)
+                aqi_values.append(aqi)
+                
+            except Exception as e:
+                logger.error(f"Error processing tile {tile.get('tile_id', 'unknown')}: {str(e)}")
+                continue
+     
+        
+        summary = {
+            "total_tiles": len(tile_results),
+            "avg_aqi": round(sum(aqi_values) / len(aqi_values), 2) if aqi_values else None,
+            "min_aqi": int(min(aqi_values)) if aqi_values else None,
+            "max_aqi": int(max(aqi_values)) if aqi_values else None
+        }
+
+        return jsonify({
+            "tiles": tile_results,
+            "summary": summary,
+            "bounds": bounds_data,
+            "start_date": start_date,
+            "end_date": end_date,
+            "tile_size_km": tile_size_km,
+        }), 200
+        
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        logger.error(f"Error fetching tile-based AQI data: {str(e)}")
+        logger.error(f"Traceback: {error_trace}")
+        return jsonify({
+            'error': f'Failed to fetch tile-based AQI data: {str(e)}',
+            'details': 'Please check the backend logs for more information'
+        }), 500
+
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -2128,7 +2693,4 @@ def health_check():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=9000)
-
-
-# weather API
+    app.run(debug=True, host='0.0.0.0', port=5000)

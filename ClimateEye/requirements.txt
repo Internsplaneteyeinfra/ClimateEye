@@ -7,8 +7,6 @@ requests
 requests-cache
 retry-requests
 
-openmeteo-requests
-
 groq
 
 numpy
