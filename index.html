@@ -92,8 +92,11 @@ map.on(L.Draw.Event.CREATED, e => {
   selectedPolygon = e.layer.getLatLngs()[0];
 });
 
+/* ---------------- CLICK AQI POPUP ---------------- */
 map.on("click", function (e) {
-  fetch("http://localhost:5000/api/aqi/value", {
+  if (!selectedPolygon) return; // ❗ no polygon → no AQI
+
+  fetch("http://localhost:8000/api/aqi/value", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -103,13 +106,13 @@ map.on("click", function (e) {
   })
   .then(res => res.json())
   .then(data => {
-    if (!data.inside) return;
+    if (!data.inside || data.aqi == null) return;
 
     L.popup()
       .setLatLng(e.latlng)
       .setContent(`
         <b>AQI:</b> ${data.aqi}<br/>
-        <b>Category:</b> ${data.category}
+        <b>Category:</b> ${data.category || "N/A"}
       `)
       .openOn(map);
   });
@@ -131,37 +134,56 @@ function applyAQI() {
 
   const payload = {
     polygon,
-    start_date: date,
-    end_date: date,
+    date: date,
     tile_size_km: parseFloat(document.getElementById("tileSize").value)
   };
 
-  /* 1️⃣ Call existing tiles API (NO DRAWING) */
-  fetch("http://localhost:5000/api/aqi/tiles", {
+  /* 1️⃣ Call tiles API (sets cache only) */
+  fetch("http://localhost:8000/api/aqi/tiles", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   })
-  .then(res => res.json())
+  .then(res => {
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    return res.json();
+  })
   .then(data => {
+    console.log(`Generated ${data.tiles.length} tiles`);
+    
     if (aqiRasterLayer) {
       map.removeLayer(aqiRasterLayer);
     }
 
-    /* 2️⃣ Add raster AQI tiles */
+    /* 2️⃣ Raster visualization */
     aqiRasterLayer = L.tileLayer(
-      "http://localhost:5000/api/aqi/raster/{z}/{x}/{y}.png",
+      "http://localhost:8000/api/aqi/raster/{z}/{x}/{y}.png",
       {
-        opacity: 0.75,
-        zIndex: 600
+        opacity: 0.8,
+        zIndex: 600,
+        tileSize: 256,
+        zoomOffset: 0,
+        maxZoom: 18,
+        minZoom: 0,
+        crossOrigin: true,
+        errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
       }
     );
 
     aqiRasterLayer.addTo(map);
+    
+    // Force refresh to ensure tiles load
+    setTimeout(() => {
+      map.invalidateSize();
+      // Trigger tile reload
+      aqiRasterLayer.redraw();
+    }, 100);
   })
   .catch(err => {
-    console.error(err);
-    alert("Backend error");
+    console.error("Error applying AQI:", err);
+    alert("Error applying AQI: " + err.message);
   });
 }
 </script>

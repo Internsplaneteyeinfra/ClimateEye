@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from datetime import datetime, timedelta, timezone
-import openmeteo_requests
+import requests
 import requests_cache
 from retry_requests import retry
 import logging,os
@@ -11,9 +11,12 @@ import math
 import random
 from io import BytesIO
 from PIL import Image
+from cachetools import TTLCache
+import numpy as np
 
 load_dotenv()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 
 def get_next_hour_record(hourly_records, current_hour):
@@ -302,57 +305,40 @@ def get_relative_humidity(latitude, longitude, target_datetime):
         
         date_str = dt.strftime('%Y-%m-%d')
         
-        url = "https://api.open-meteo.com/v1/forecast"
+        url = "https://api.weatherapi.com/v1/forecast.json"
         params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": ["relative_humidity_2m"],
-            "start_date": date_str,
-            "end_date": date_str,
-            "timezone": "auto"
+            "key": WEATHER_API_KEY,
+            "q": f"{latitude},{longitude}",
+            "days": 1
         }
         
-        # For today, request tomorrow too to get full forecast (same as weather/hourly)
+        # For today, request tomorrow too to get full forecast 
         today = datetime.now().date()
         is_today = False
         try:
             request_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             is_today = request_date == today
             if is_today:
-                tomorrow = (request_date + timedelta(days=1)).strftime('%Y-%m-%d')
-                params["end_date"] = tomorrow
+                params["days"] = 2
         except ValueError:
             pass
         
-        responses = openmeteo.weather_api(url, params=params)
+        response = retry_session.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
         
-        if not responses:
+        if not data:
             return None
         
-        response = responses[0]
-        hourly = response.Hourly()
-        hourly_humidity = hourly.Variables(0).ValuesAsNumpy()
+        # Extract hourly humidity data
+        forecast = data.get("forecast", {}).get("forecastday", [])
+        hourly_times = []
+        hourly_humidity = []
         
-        # Get hourly times - use same logic as weather/hourly endpoint
-        try:
-            start_time = float(hourly.Time())
-            num_values = len(hourly_humidity)
-            try:
-                interval = float(hourly.Interval())
-            except (AttributeError, TypeError, ValueError):
-                interval = 3600  # Default to 1 hour
-            hourly_times = [start_time + (i * interval) for i in range(num_values)]
-        except (AttributeError, TypeError, ValueError) as e:
-            logger.error(f"Error getting hourly times: {str(e)}")
-            try:
-                hourly_times_array = hourly.Time()
-                if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
-                    hourly_times = list(hourly_times_array)
-                else:
-                    hourly_times = []
-            except Exception as e2:
-                logger.error(f"Error in fallback time parsing: {str(e2)}")
-                hourly_times = []
+        for day in forecast:
+            for hour_data in day.get("hour", []):
+                hourly_times.append(hour_data["time_epoch"])
+                hourly_humidity.append(hour_data.get("humidity"))
         
         # Match exact hour - use same logic as weather/hourly endpoint
         # Normalize target datetime to hour boundary (minute=0, second=0, microsecond=0)
@@ -375,10 +361,10 @@ def get_relative_humidity(latitude, longitude, target_datetime):
                     hour_datetime.day == target_hour.day and
                     hour_datetime.hour == target_hour.hour):
                     if i < len(hourly_humidity):
-                        rh_value = float(hourly_humidity[i])
-                        if rh_value != rh_value:  # NaN check
+                        rh_value = hourly_humidity[i]
+                        if rh_value is None or (isinstance(rh_value, float) and rh_value != rh_value):  # NaN check
                             return None
-                        return rh_value
+                        return float(rh_value)
             except (TypeError, ValueError, OSError):
                 continue
         
@@ -397,10 +383,10 @@ def get_relative_humidity(latitude, longitude, target_datetime):
                 continue
         
         if closest_index >= 0 and closest_index < len(hourly_humidity):
-            rh_value = float(hourly_humidity[closest_index])
-            if rh_value != rh_value:  # NaN check
+            rh_value = hourly_humidity[closest_index]
+            if rh_value is None or (isinstance(rh_value, float) and rh_value != rh_value):  # NaN check
                 return None
-            return rh_value
+            return float(rh_value)
         
         return None
     except Exception as e:
@@ -628,14 +614,12 @@ AQI_VIS_PARAMS = {
 }
 
 def latlon_to_tile(lat, lon, z):
+    """Convert lat/lon to tile coordinates ."""
+    n = 2 ** z
+    x = int((lon + 180.0) / 360.0 * n)
     lat_rad = math.radians(lat)
-    n = 2.0 ** z
-    xtile = int((lon + 180.0) / 360.0 * n)
-    ytile = int(
-        (1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi)
-        / 2.0 * n
-    )
-    return xtile, ytile
+    y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return x, y
 
 
 def hex_to_rgb(hex_color):
@@ -644,24 +628,48 @@ def hex_to_rgb(hex_color):
 
 
 def get_palette_color(aqi):
-    breaks = [50, 100, 150, 200, 300, 500]
-    for i, b in enumerate(breaks):
-        if aqi <= b:
-            return hex_to_rgb(AQI_VIS_PARAMS["palette"][i])
-    return hex_to_rgb(AQI_VIS_PARAMS["palette"][-1])
+    """
+    Smooth gradient color for raster (SAFE)
+    """
+    aqi = max(0, min(aqi, 300))  
 
-def interpolate_aqi(lat, lon, tiles, radius_km=2.0):
+    stops = [0, 50, 100, 150, 200, 300]
+    colors = [
+        (0, 228, 0),     # Green
+        (255, 255, 0),   # Yellow
+        (255, 126, 0),   # Orange
+        (255, 0, 0),     # Red
+        (143, 63, 151),  # Purple
+        (126, 0, 35)     # Maroon
+    ]
+
+    for i in range(len(stops) - 1):
+        if stops[i] <= aqi <= stops[i + 1]:
+            t = (aqi - stops[i]) / (stops[i + 1] - stops[i])
+            return tuple(
+                int(colors[i][j] + t * (colors[i + 1][j] - colors[i][j]))
+                for j in range(3)
+            )
+
+    return colors[-1]
+
+
+def interpolate_aqi(lat, lon, spatial_points, radius_km=15.0):
     """
     Inverse Distance Weighting (IDW)
     Smooth AQI interpolation
     """
-    total = 0
-    weight_sum = 0
+    total = 0.0
+    weight_sum = 0.0
 
-    for tile in tiles:
-        tlat = tile["lat"]
-        tlon = tile["lon"]
-        aqi = tile["aqi"]
+    for p in spatial_points:
+        tlat = p["lat"]
+        tlon = p["lon"]
+        aqi = p["aqi"]
+  
+        
+        if aqi is None:
+            continue
 
         d = haversine_km(lat, lon, tlat, tlon)
         if d > radius_km:
@@ -673,30 +681,32 @@ def interpolate_aqi(lat, lon, tiles, radius_km=2.0):
         total += w * aqi
         weight_sum += w
 
-    return int(total / weight_sum) if weight_sum > 0 else 0
+    return int(total / weight_sum) if weight_sum else None
 
 
 def generate_spatial_points_from_tile(tile, points_per_tile=6):
     """
-    Convert ONE tile AQI into MULTIPLE spatial AQI points
-    (this is what enables blending)
+    Generate spatial points from AQI grid tile (VIEW LAYER ONLY)
     """
-    points = []
+    spatial_points = []
 
     b = tile["bounds"]
     aqi = tile["aqi"]
+
+    # if aqi is None:
+    #     return points
 
     for _ in range(points_per_tile):
         lat = random.uniform(b["min_lat"], b["max_lat"])
         lon = random.uniform(b["min_lon"], b["max_lon"])
 
-        points.append({
+        spatial_points.append({
             "lat": lat,
             "lon": lon,
             "aqi": aqi
         })
 
-    return points
+    return spatial_points
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -725,8 +735,12 @@ def pixel_to_latlon(px, py, z, x, y):
 
 AQI_TILE_CACHE = {
     "tiles": [],
+    "spatial_points": [],
     "meta": {}
 }
+
+# Tile-level cache for raster tiles 
+TILE_CACHE = TTLCache(maxsize=5000, ttl=3600)
 
 app = Flask(__name__)
 CORS(app)
@@ -735,11 +749,262 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Setup the Open-Meteo API client with cache and retry on error
-# Reduced cache time to 5 minutes for more real-time data
 cache_session = requests_cache.CachedSession('.cache', expire_after=300)
 retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-openmeteo = openmeteo_requests.Client(session=retry_session)
+
+class WeatherAPIAdapter:
+    def __init__(self, session, api_key):
+        self.session = session
+        self.api_key = api_key
+        self.base_url = "https://api.weatherapi.com/v1"
+    
+    def weather_api(self, url, params=None):
+        if params is None:
+            params = {}
+        
+        if isinstance(url, str):
+            if "history.json" in url:
+                request_params = params.copy()
+            elif "forecast.json" in url:
+                request_params = params.copy()
+            else:
+                request_params = params.copy()
+        else:
+            request_params = params.copy()
+        
+        if "aqi" in request_params or "air-quality" in str(url):
+            api_type = "air_quality"
+            if "aqi" not in request_params:
+                request_params["aqi"] = "yes"
+        else:
+            api_type = "weather"
+        
+        response = self.session.get(url, params=request_params)
+        response.raise_for_status()
+        data = response.json()
+        
+        return [WeatherAPIResponse(data, api_type)]
+
+class WeatherAPIResponse:
+    def __init__(self, data, api_type):
+        self.data = data
+        self.api_type = api_type
+    
+    def Hourly(self):
+        return WeatherAPIHourly(self.data, self.api_type)
+    
+    def Daily(self):
+        return WeatherAPIDaily(self.data, self.api_type)
+
+class WeatherAPIHourly:
+    def __init__(self, data, api_type):
+        self.data = data
+        self.api_type = api_type
+        self.hourly_data = []
+        self.times = []
+        self._build_hourly_data()
+    
+    def _build_hourly_data(self):
+        if self.api_type == "air_quality":
+            forecast = self.data.get("forecast", {}).get("forecastday", [])
+            if not forecast:
+                current = self.data.get("current", {})
+                if current:
+                    aqi = current.get("air_quality", {})
+                    self.times.append(current.get("last_updated_epoch", 0))
+                    self.hourly_data.append({
+                        "pm10": aqi.get("pm10"),
+                        "pm2_5": aqi.get("pm2_5"),
+                        "carbon_monoxide": aqi.get("co"),
+                        "nitrogen_dioxide": aqi.get("no2"),
+                        "sulphur_dioxide": aqi.get("so2"),
+                        "ozone": aqi.get("o3")
+                    })
+            
+            for day in forecast:
+                for hour_data in day.get("hour", []):
+                    self.times.append(hour_data.get("time_epoch", 0))
+                    aqi = hour_data.get("air_quality", {})
+                    self.hourly_data.append({
+                        "pm10": aqi.get("pm10"),
+                        "pm2_5": aqi.get("pm2_5"),
+                        "carbon_monoxide": aqi.get("co"),
+                        "nitrogen_dioxide": aqi.get("no2"),
+                        "sulphur_dioxide": aqi.get("so2"),
+                        "ozone": aqi.get("o3")
+                    })
+        else:
+            forecast = self.data.get("forecast", {}).get("forecastday", [])
+            if not forecast:
+                current = self.data.get("current", {})
+                if current:
+                    self.times.append(current.get("last_updated_epoch", 0))
+                    self.hourly_data.append({
+                        "temperature_2m": current.get("temp_c"),
+                        "relative_humidity_2m": current.get("humidity"),
+                        "apparent_temperature": current.get("feelslike_c"),
+                        "weather_code": self._map_weather_code(current.get("condition", {}).get("code")),
+                        "wind_speed_10m": current.get("wind_kph", 0) / 3.6 if current.get("wind_kph") else None,
+                        "wind_direction_10m": current.get("wind_degree"),
+                        "wind_gusts_10m": current.get("gust_kph", 0) / 3.6 if current.get("gust_kph") else None,
+                        "uv_index": current.get("uv"),
+                        "precipitation": 0,
+                        "cloud_cover": current.get("cloud"),
+                        "visibility": current.get("vis_km", 0) * 1000 if current.get("vis_km") else None,
+                        "surface_pressure": current.get("pressure_mb")
+                    })
+            
+            for day in forecast:
+                for hour_data in day.get("hour", []):
+                    self.times.append(hour_data.get("time_epoch", 0))
+                    self.hourly_data.append({
+                        "temperature_2m": hour_data.get("temp_c"),
+                        "relative_humidity_2m": hour_data.get("humidity"),
+                        "apparent_temperature": hour_data.get("feelslike_c"),
+                        "weather_code": self._map_weather_code(hour_data.get("condition", {}).get("code")),
+                        "wind_speed_10m": hour_data.get("wind_kph", 0) / 3.6 if hour_data.get("wind_kph") else None,
+                        "wind_direction_10m": hour_data.get("wind_degree"),
+                        "wind_gusts_10m": hour_data.get("gust_kph", 0) / 3.6 if hour_data.get("gust_kph") else None,
+                        "uv_index": hour_data.get("uv"),
+                        "precipitation": hour_data.get("precip_mm"),
+                        "cloud_cover": hour_data.get("cloud"),
+                        "visibility": hour_data.get("vis_km", 0) * 1000 if hour_data.get("vis_km") else None,
+                        "surface_pressure": hour_data.get("pressure_mb")
+                    })
+    
+    def _map_weather_code(self, code):
+        if code is None:
+            return 0
+        wmo_map = {
+            1000: 0, 1003: 2, 1006: 3, 1009: 3,
+            1030: 45, 1063: 61, 1066: 71, 1069: 66,
+            1072: 56, 1087: 95, 1114: 77, 1117: 77,
+            1135: 45, 1147: 48, 1150: 51, 1153: 51,
+            1168: 57, 1171: 57, 1180: 61, 1183: 61,
+            1186: 63, 1189: 63, 1192: 65, 1195: 65,
+            1198: 66, 1201: 67, 1204: 66, 1207: 67,
+            1210: 71, 1213: 71, 1216: 73, 1219: 73,
+            1222: 75, 1225: 75, 1237: 77, 1240: 80,
+            1243: 81, 1246: 82, 1249: 80, 1252: 81,
+            1255: 82, 1258: 85, 1261: 86, 1264: 85,
+            1273: 95, 1276: 96, 1279: 99, 1282: 95
+        }
+        return wmo_map.get(code, 0)
+    
+    def Time(self):
+        if not self.times:
+            return 0
+        if len(self.times) == 1:
+            return float(self.times[0])
+        return np.array(self.times, dtype=float)
+    
+    def Interval(self):
+        return 3600
+    
+    def Variables(self, index):
+        if self.api_type == "air_quality":
+            var_map = ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", "sulphur_dioxide", "ozone"]
+        else:
+            var_map = ["temperature_2m", "relative_humidity_2m", "apparent_temperature", "weather_code", 
+                      "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m", "uv_index", 
+                      "precipitation", "cloud_cover", "visibility", "surface_pressure"]
+        
+        if index < len(var_map):
+            values = [h.get(var_map[index]) for h in self.hourly_data]
+            return WeatherAPIVariable(values)
+        return WeatherAPIVariable([])
+
+class WeatherAPIDaily:
+    def __init__(self, data, api_type):
+        self.data = data
+        self.api_type = api_type
+        self.daily_data = []
+        self.times = []
+        self._build_daily_data()
+    
+    def _build_daily_data(self):
+        forecast = self.data.get("forecast", {}).get("forecastday", [])
+        if not forecast:
+            current = self.data.get("current", {})
+            if current:
+                self.times.append(current.get("last_updated_epoch", 0))
+                self.daily_data.append({
+                    "temperature_2m_max": current.get("temp_c"),
+                    "temperature_2m_min": current.get("temp_c"),
+                    "weather_code": self._map_weather_code(current.get("condition", {}).get("code")),
+                    "wind_speed_10m_max": current.get("wind_kph", 0) / 3.6 if current.get("wind_kph") else None,
+                    "relative_humidity_2m_max": current.get("humidity"),
+                    "uv_index_max": current.get("uv"),
+                    "precipitation_sum": 0
+                })
+        
+        for day in forecast:
+            date_str = day.get("date", "")
+            try:
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                self.times.append(int(date_obj.timestamp()))
+            except:
+                self.times.append(day.get("date_epoch", 0))
+            day_data = day.get("day", {})
+            self.daily_data.append({
+                "temperature_2m_max": day_data.get("maxtemp_c"),
+                "temperature_2m_min": day_data.get("mintemp_c"),
+                "weather_code": self._map_weather_code(day_data.get("condition", {}).get("code")),
+                "wind_speed_10m_max": day_data.get("maxwind_kph", 0) / 3.6 if day_data.get("maxwind_kph") else None,
+                "relative_humidity_2m_max": day_data.get("avghumidity"),
+                "uv_index_max": day_data.get("uv"),
+                "precipitation_sum": day_data.get("totalprecip_mm")
+            })
+    
+    def _map_weather_code(self, code):
+        if code is None:
+            return 0
+        wmo_map = {
+            1000: 0, 1003: 2, 1006: 3, 1009: 3,
+            1030: 45, 1063: 61, 1066: 71, 1069: 66,
+            1072: 56, 1087: 95, 1114: 77, 1117: 77,
+            1135: 45, 1147: 48, 1150: 51, 1153: 51,
+            1168: 57, 1171: 57, 1180: 61, 1183: 61,
+            1186: 63, 1189: 63, 1192: 65, 1195: 65,
+            1198: 66, 1201: 67, 1204: 66, 1207: 67,
+            1210: 71, 1213: 71, 1216: 73, 1219: 73,
+            1222: 75, 1225: 75, 1237: 77, 1240: 80,
+            1243: 81, 1246: 82, 1249: 80, 1252: 81,
+            1255: 82, 1258: 85, 1261: 86, 1264: 85,
+            1273: 95, 1276: 96, 1279: 99, 1282: 95
+        }
+        return wmo_map.get(code, 0)
+    
+    def Time(self):
+        if not self.times:
+            return 0
+        if len(self.times) == 1:
+            return float(self.times[0])
+        return np.array(self.times, dtype=float)
+    
+    def Interval(self):
+        return 86400
+    
+    def Variables(self, index):
+        var_map = ["temperature_2m_max", "temperature_2m_min", "weather_code", 
+                  "wind_speed_10m_max", "relative_humidity_2m_max", "uv_index_max", "precipitation_sum"]
+        
+        if index < len(var_map):
+            values = [d.get(var_map[index]) for d in self.daily_data]
+            return WeatherAPIVariable(values)
+        return WeatherAPIVariable([])
+
+class WeatherAPIVariable:
+    def __init__(self, values):
+        self.values = values
+    
+    def ValuesAsNumpy(self):
+        if not self.values:
+            return np.array([])
+        arr = np.array([float(v) if v is not None and not (isinstance(v, float) and v != v) else np.nan for v in self.values])
+        return arr
+
+openmeteo = WeatherAPIAdapter(retry_session, WEATHER_API_KEY)
 
 
 def calculate_aqi(pm25, pm10, o3=None, no2=None, so2=None, co=None):
@@ -894,7 +1159,7 @@ def calculate_aqi(pm25, pm10, o3=None, no2=None, so2=None, co=None):
 @app.route('/api/aqi', methods=['POST'])
 def get_aqi():
     """
-    Get Air Quality Index data from Open-Meteo
+    Get Air Quality Index data from Weather API
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     """
     try:
@@ -907,29 +1172,37 @@ def get_aqi():
             return jsonify({'error': 'Latitude and longitude are required'}), 400
         
         # Parse date if provided
-        start_date = None
-        end_date = None
+        date = None
         if date:
             try:
                 date_obj = datetime.strptime(date, '%Y-%m-%d')
-                start_date = date_obj.strftime('%Y-%m-%d')
+                date = date_obj.strftime('%Y-%m-%d')
                 end_date = date_obj.strftime('%Y-%m-%d')
             except ValueError:
                 return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
         
-        url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+        url = "https://api.weatherapi.com/v1/forecast.json"
         params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
-                      "sulphur_dioxide", "ozone"],
+            "key": WEATHER_API_KEY,
+            "q": f"{latitude},{longitude}",
+            "aqi": "yes",
+            "days": 1
         }
         
-        if start_date and end_date:
-            params["start_date"] = start_date
-            params["end_date"] = end_date
+        if date and end_date:
+            try:
+                start_obj = datetime.strptime(date, '%Y-%m-%d')
+                today = datetime.now().date()
+                if start_obj.date() < today:
+                    url = "https://api.weatherapi.com/v1/history.json"
+                    params["dt"] = date
+                else:
+                    days = (datetime.strptime(end_date, '%Y-%m-%d').date() - start_obj.date()).days + 1
+                    params["days"] = min(days, 10)
+            except:
+                pass
         
-        responses = openmeteo.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params)
         
         if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
@@ -1057,7 +1330,7 @@ def get_aqi():
             hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
             hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
             
-            # Get hourly times - Open-Meteo returns Unix timestamps in seconds
+            # Get hourly times - Weather API returns Unix timestamps in seconds
             # hourly.Time() might return a single start timestamp or an array
             # We'll calculate timestamps from start time and interval if needed
             try:
@@ -1242,7 +1515,7 @@ def get_aqi():
 @app.route('/api/aqi/hourly', methods=['POST'])
 def get_aqi_hourly():
     """
-    Get hourly Air Quality Index data from Open-Meteo for a specific date
+    Get hourly Air Quality Index data from Weather API for a specific date
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     Returns: Array of hourly AQI records with trend indicators
     """
@@ -1265,14 +1538,12 @@ def get_aqi_hourly():
         except ValueError:
             return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
         
-        url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+        url = "https://api.weatherapi.com/v1/forecast.json"
         params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
-                      "sulphur_dioxide", "ozone"],
-            "start_date": start_date,
-            "end_date": end_date,
+            "key": WEATHER_API_KEY,
+            "q": f"{latitude},{longitude}",
+            "aqi": "yes",
+            "days": 1
         }
         
         # For today, ensure we get forecast data by requesting up to tomorrow
@@ -1280,13 +1551,14 @@ def get_aqi_hourly():
         try:
             request_date = datetime.strptime(date, '%Y-%m-%d').date()
             if request_date == today:
-                # Request data for today and tomorrow to get full forecast
-                tomorrow = (request_date + timedelta(days=1)).strftime('%Y-%m-%d')
-                params["end_date"] = tomorrow
+                params["days"] = 2
+            elif request_date < today:
+                url = "https://api.weatherapi.com/v1/history.json"
+                params["dt"] = date
         except ValueError:
             pass
         
-        responses = openmeteo.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params)
         
         if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
@@ -1533,21 +1805,21 @@ def get_aqi_hourly_range():
             date_str = current_date.strftime('%Y-%m-%d')
             
             # Use the existing hourly endpoint logic
-            url = "https://air-quality-api.open-meteo.com/v1/air-quality"
+            url = "https://api.weatherapi.com/v1/forecast.json"
             params = {
-                "latitude": latitude,
-                "longitude": longitude,
-                "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
-                          "sulphur_dioxide", "ozone"],
-                "start_date": date_str,
-                "end_date": date_str,
+                "key": WEATHER_API_KEY,
+                "q": f"{latitude},{longitude}",
+                "aqi": "yes",
+                "days": 1
             }
             
             # For today, request tomorrow too to get full forecast
             today = datetime.now().date()
             if current_date.date() == today:
-                tomorrow = (current_date.date() + timedelta(days=1)).strftime('%Y-%m-%d')
-                params["end_date"] = tomorrow
+                params["days"] = 2
+            elif current_date.date() < today:
+                url = "https://api.weatherapi.com/v1/history.json"
+                params["dt"] = date_str
             
             try:
                 responses = openmeteo.weather_api(url, params=params)
@@ -1718,7 +1990,7 @@ def get_aqi_hourly_range():
 @app.route('/api/weather', methods=['POST'])
 def get_weather():
     """
-    Get Weather data from Open-Meteo
+    Get Weather data from Weather API
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     """
     try:
@@ -1731,8 +2003,6 @@ def get_weather():
             return jsonify({'error': 'Latitude and longitude are required'}), 400
         
         # Use forecast API for current weather with UV index
-        url = "https://api.open-meteo.com/v1/forecast"
-        
         # Check if this is a historical date (before today)
         today = datetime.now().date()
         is_historical = False
@@ -1743,34 +2013,30 @@ def get_weather():
             except ValueError:
                 is_historical = False
         
-        params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "timezone": "auto"
-        }
-        
         if is_historical:
-            # For historical dates, use hourly data to calculate daily averages
-            params["hourly"] = ["temperature_2m", "relative_humidity_2m", "apparent_temperature", 
-                               "weather_code", "wind_speed_10m", "uv_index"]
-            params["daily"] = ["temperature_2m_max", "temperature_2m_min", "weather_code", 
-                             "wind_speed_10m_max", "relative_humidity_2m_max", "uv_index_max"]
+            url = "https://api.weatherapi.com/v1/history.json"
+            params = {
+                "key": WEATHER_API_KEY,
+                "q": f"{latitude},{longitude}",
+                "dt": date
+            }
         else:
-            # For current date, use hourly and daily data
-            params["hourly"] = ["temperature_2m", "relative_humidity_2m", "apparent_temperature", 
-                               "weather_code", "wind_speed_10m", "uv_index"]
-            params["daily"] = ["temperature_2m_max", "temperature_2m_min", "weather_code", 
-                             "wind_speed_10m_max", "relative_humidity_2m_max", "uv_index_max"]
+            url = "https://api.weatherapi.com/v1/forecast.json"
+            params = {
+                "key": WEATHER_API_KEY,
+                "q": f"{latitude},{longitude}",
+                "days": 1
+            }
+            if date:
+                try:
+                    date_obj = datetime.strptime(date, '%Y-%m-%d')
+                    days = (date_obj.date() - today).days + 1
+                    if days > 0:
+                        params["days"] = min(days, 10)
+                except ValueError:
+                    pass
         
-        if date:
-            try:
-                date_obj = datetime.strptime(date, '%Y-%m-%d')
-                params["start_date"] = date_obj.strftime('%Y-%m-%d')
-                params["end_date"] = date_obj.strftime('%Y-%m-%d')
-            except ValueError:
-                return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
-        
-        responses = openmeteo.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params)
         
         if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
@@ -1863,7 +2129,7 @@ def get_weather():
             hourly_wind_speed = hourly.Variables(4).ValuesAsNumpy()
             hourly_uv_index = hourly.Variables(5).ValuesAsNumpy()
             
-            # Get hourly times - Open-Meteo returns Unix timestamps in seconds
+            # Get hourly times - Weather API returns Unix timestamps in seconds
             # hourly.Time() might return a single start timestamp or an array
             # We'll calculate timestamps from start time and interval if needed
             try:
@@ -2008,7 +2274,7 @@ def get_weather():
 @app.route('/api/weather/hourly', methods=['POST'])
 def get_weather_hourly():
     """
-    Get hourly Weather data from Open-Meteo for a specific date
+    Get hourly Weather data from Weather API for a specific date
     Expects: { "latitude": float, "longitude": float, "date": "YYYY-MM-DD" }
     Returns: Array of hourly weather records
     """
@@ -2031,31 +2297,30 @@ def get_weather_hourly():
         except ValueError:
             return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
 
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "hourly": ["temperature_2m", "relative_humidity_2m", "apparent_temperature", 
-                      "weather_code", "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
-                      "uv_index", "precipitation", "cloud_cover", "visibility", "surface_pressure"],
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-        
-        # For today, ensure we get forecast data by requesting up to tomorrow
         today = datetime.now().date()
         is_today = False
         try:
             request_date = datetime.strptime(date, '%Y-%m-%d').date()
             is_today = request_date == today
-            if is_today:
-                # Request data for today and tomorrow to get full forecast
-                tomorrow = (request_date + timedelta(days=1)).strftime('%Y-%m-%d')
-                params["end_date"] = tomorrow
         except ValueError:
             pass
+        
+        if is_today or request_date > today:
+            url = "https://api.weatherapi.com/v1/forecast.json"
+            params = {
+                "key": WEATHER_API_KEY,
+                "q": f"{latitude},{longitude}",
+                "days": 2 if is_today else 1
+            }
+        else:
+            url = "https://api.weatherapi.com/v1/history.json"
+            params = {
+                "key": WEATHER_API_KEY,
+                "q": f"{latitude},{longitude}",
+                "dt": date
+            }
 
-        responses = openmeteo.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params)
 
         if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
@@ -2221,7 +2486,7 @@ def get_weather_hourly():
 @app.route('/api/weather/monthly', methods=['POST'])
 def get_weather_monthly():
     """
-    Get monthly weather forecast data from Open-Meteo
+    Get monthly weather forecast data from Weather API
     Expects: { "latitude": float, "longitude": float, "year": int, "month": int }
     Returns: Array of daily weather records for the month
     """
@@ -2249,17 +2514,15 @@ def get_weather_monthly():
             first_day = datetime(year, month, 1).date()
             last_day = datetime(year, month + 1, 1).date() - timedelta(days=1)
         
-        url = "https://api.open-meteo.com/v1/forecast"
+        url = "https://api.weatherapi.com/v1/forecast.json"
+        days = (last_day - first_day).days + 1
         params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "daily": ["temperature_2m_max", "temperature_2m_min", "weather_code", "precipitation_sum"],
-            "start_date": first_day.strftime('%Y-%m-%d'),
-            "end_date": last_day.strftime('%Y-%m-%d'),
-            "timezone": "auto"
+            "key": WEATHER_API_KEY,
+            "q": f"{latitude},{longitude}",
+            "days": min(days, 10)
         }
         
-        responses = openmeteo.weather_api(url, params=params)
+        responses = openmeteo.weather_api(url, params)
         
         if not responses:
             return jsonify({'error': 'No data available for the specified location'}), 404
@@ -2498,413 +2761,208 @@ def analyze_aqi_with_llm():
             "details": str(e)
         }), 500
 
+
 @app.route('/api/aqi/tiles', methods=['POST'])
 def get_aqi_tiles():
-    """
-    Get tile-based AQI data for a polygon area (geometry-based)
-    
-    Accepts either:
-    1. Polygon geometry (preferred):
-    {
-        "polygon": [
-            [lat1, lon1],
-            [lat2, lon2],
-            [lat3, lon3],
-            ...
-        ],
-        "start_date": "YYYY-MM-DD",
-        "end_date": "YYYY-MM-DD",
-        "tile_size_km": float (optional, default 0.5),
-        "use_0to3m": bool (optional, default True)
-    }
-    
-    Returns:
-    {
-        "tiles": [
-            {
-                "tile_id": str,
-                "center": {"latitude": float, "longitude": float},
-                "bounds": {"min_lat": float, "max_lat": float, "min_lon": float, "max_lon": float},
-                "aqi": int,
-                "aqi_0to3m": int,
-                "color": str (hex),
-                "category": str,
-                "label": str,
-                "pm2_5": float,
-                "pm10": float,
-                "pm2_5_0to3m": float,
-                "pm10_0to3m": float
-            }
-        ],
-        "summary": {
-            "total_tiles": int,
-            "avg_aqi": float,
-            "avg_aqi_0to3m": float,
-            "min_aqi": int,
-            "max_aqi": int
-        }
-    }
-    """
-    try:
-        data = request.get_json()
-        polygon = data.get('polygon')
-        start_date = data.get('start_date')
-        end_date = data.get('end_date')
-        tile_size_km = data.get('tile_size_km', 0.5)  # Default 500m tiles
-        
-        if not start_date or not end_date:
-            return jsonify({'error': 'Start date and end date are required'}), 400
-        
-        if not polygon:
-            return jsonify({'error': 'Polygon is required'}), 400
-        
-        if not isinstance(polygon, list) or len(polygon) < 3:
-            return jsonify({'error': 'Polygon must be a list of at least 3 [latitude, longitude] pairs'}), 400
+    data = request.get_json()
 
-        # Validate polygon coordinates
-        for point in polygon:
-            if not isinstance(point, list) or len(point) != 2:
-                return jsonify({'error': 'Each polygon point must be [latitude, longitude]'}), 400
-            lat, lon = point
-            if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
-                return jsonify({'error': 'Coordinates must be numbers'}), 400
-            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-                return jsonify({'error': 'Invalid coordinates: lat must be -90 to 90, lon must be -180 to 180'}), 400
-        
-        # Generate tiles for polygon
-        tiles = generate_tiles_for_polygon(polygon, tile_size_km)
-        bounds_data = get_polygon_bounds(polygon)
-        
-        if len(tiles) > 1000:  # Limit to prevent excessive API calls
-            return jsonify({
-                'error': f'Too many tiles ({len(tiles)}). Please use a smaller area or larger tile size.',
-                'suggestion': f'Try tile_size_km >= {tile_size_km * (len(tiles) / 1000):.2f}'
-            }), 400
-        
-        # Calculate AQI for each tile
-        tile_results = []
-        aqi_values = []
-        tile_index = 0  # Initialize tile index for dummy AQI mapping
-        
-        # Use date range endpoint to get hourly data for date range
-        # For each tile, we'll calculate average AQI over the date range
-        for tile in tiles:
-            try:
-                center_lat = tile['center']['latitude']
-                center_lon = tile['center']['longitude']
-                
-                # Fetch hourly AQI data for the date range
-                url = "https://air-quality-api.open-meteo.com/v1/air-quality"
-                params = {
-                    "latitude": center_lat,
-                    "longitude": center_lon,
-                    "hourly": ["pm10", "pm2_5", "carbon_monoxide", "nitrogen_dioxide", 
-                              "sulphur_dioxide", "ozone"],
-                    "start_date": start_date,
-                    "end_date": end_date,
-                }
-                
-                # For today, request tomorrow too to get full forecast
-                today = datetime.now().date()
-                try:
-                    request_start = datetime.strptime(start_date, '%Y-%m-%d').date()
-                    request_end = datetime.strptime(end_date, '%Y-%m-%d').date()
-                    if request_start <= today <= request_end:
-                        tomorrow = (today + timedelta(days=1)).strftime('%Y-%m-%d')
-                        params["end_date"] = tomorrow
-                except ValueError:
-                    pass
-                
-                responses = openmeteo.weather_api(url, params=params)
-                
-                if not responses:
-                    # Skip tile if no data available
-                    continue
-                
-                response = responses[0]
-                hourly = response.Hourly()
-                hourly_pm10 = hourly.Variables(0).ValuesAsNumpy()
-                hourly_pm2_5 = hourly.Variables(1).ValuesAsNumpy()
-                hourly_carbon_monoxide = hourly.Variables(2).ValuesAsNumpy()
-                hourly_nitrogen_dioxide = hourly.Variables(3).ValuesAsNumpy()
-                hourly_sulphur_dioxide = hourly.Variables(4).ValuesAsNumpy()
-                hourly_ozone = hourly.Variables(5).ValuesAsNumpy()
-                
-                # Get hourly times
-                try:
-                    start_time = float(hourly.Time())
-                    num_values = len(hourly_pm10)
-                    try:
-                        interval = float(hourly.Interval())
-                    except (AttributeError, TypeError, ValueError):
-                        interval = 3600
-                    hourly_times = [start_time + (i * interval) for i in range(num_values)]
-                except (AttributeError, TypeError, ValueError):
-                    try:
-                        hourly_times_array = hourly.Time()
-                        if hasattr(hourly_times_array, '__iter__') and not isinstance(hourly_times_array, (str, bytes)):
-                            hourly_times = list(hourly_times_array)
-                        else:
-                            hourly_times = []
-                    except Exception:
-                        hourly_times = []
-                
-                # Filter to date range and calculate averages
-                def safe_mean(arr):
-                    if len(arr) == 0:
-                        return None
-                    try:
-                        mean_val = float(arr.mean())
-                        if mean_val != mean_val:  # NaN check
-                            return None
-                        return mean_val
-                    except (ValueError, TypeError, AttributeError):
-                        return None
-                
-                # Filter hours within date range
-                start_date_obj = datetime.strptime(start_date, '%Y-%m-%d').date()
-                end_date_obj = datetime.strptime(end_date, '%Y-%m-%d').date()
-                start_datetime = datetime.combine(start_date_obj, datetime.min.time()).replace(tzinfo=timezone.utc)
-                end_datetime = datetime.combine(end_date_obj, datetime.min.time()).replace(tzinfo=timezone.utc) + timedelta(days=1)
-                
-                valid_pm10 = []
-                valid_pm2_5 = []
-                valid_co = []
-                valid_no2 = []
-                valid_so2 = []
-                valid_o3 = []
-                
-                for i in range(len(hourly_pm10)):
-                    try:
-                        hour_timestamp = float(hourly_times[i]) if i < len(hourly_times) else None
-                        if hour_timestamp:
-                            hour_datetime = datetime.fromtimestamp(hour_timestamp, tz=timezone.utc)
-                            if start_datetime <= hour_datetime < end_datetime:
-                                pm10_val = float(hourly_pm10[i]) if hourly_pm10[i] is not None else None
-                                pm2_5_val = float(hourly_pm2_5[i]) if hourly_pm2_5[i] is not None else None
-                                co_val = float(hourly_carbon_monoxide[i]) if hourly_carbon_monoxide[i] is not None else None
-                                no2_val = float(hourly_nitrogen_dioxide[i]) if hourly_nitrogen_dioxide[i] is not None else None
-                                so2_val = float(hourly_sulphur_dioxide[i]) if hourly_sulphur_dioxide[i] is not None else None
-                                o3_val = float(hourly_ozone[i]) if hourly_ozone[i] is not None else None
-                                
-                                if pm10_val is not None and pm10_val == pm10_val:  # Not NaN
-                                    valid_pm10.append(pm10_val)
-                                if pm2_5_val is not None and pm2_5_val == pm2_5_val:
-                                    valid_pm2_5.append(pm2_5_val)
-                                if co_val is not None and co_val == co_val:
-                                    valid_co.append(co_val)
-                                if no2_val is not None and no2_val == no2_val:
-                                    valid_no2.append(no2_val)
-                                if so2_val is not None and so2_val == so2_val:
-                                    valid_so2.append(so2_val)
-                                if o3_val is not None and o3_val == o3_val:
-                                    valid_o3.append(o3_val)
-                    except (IndexError, TypeError, ValueError):
-                        continue
-                
-                # Calculate averages
-                def safe_mean(values):
-                    if not values:
-                        return None
-                    try:
-                        return sum(values) / len(values)
-                    except (TypeError, ValueError):
-                        return None
-                
-                avg_pm10 = safe_mean(valid_pm10)
-                avg_pm2_5 = safe_mean(valid_pm2_5)
-                avg_co = safe_mean(valid_co)
-                avg_no2 = safe_mean(valid_no2)
-                avg_so2 = safe_mean(valid_so2)
-                avg_o3 = safe_mean(valid_o3)
-                
-                # Calculate AQI at 10m height
-                # aqi = calculate_aqi(
-                #     pm25=avg_pm2_5,
-                #     pm10=avg_pm10,
-                #     o3=avg_o3,
-                #     no2=avg_no2,
-                #     so2=avg_so2,
-                #     co=avg_co
-                # )
-                
-                # ================= DUMMY AQI MAPPING (VISUAL TESTING ONLY) =================
+    polygon = data.get("polygon")
+    date = data.get("date")
+    tile_size_km = data.get("tile_size_km", 0.5)
 
-                DUMMY_AQI_GROUPS = [
-                    25, 25, 25,              # Good
-                    75, 75, 75,             # Moderate
-                    110, 110, 110,          # Poor
-                    155, 155, 155,         # Unhealthy
-                    190, 190, 190,         # Unhealthy
-                    260, 260, 260,        # Severe
-                    310, 310 ,310,          # Hazardous
-                ]
+    if not polygon or len(polygon) < 3:
+        return jsonify({"error": "Valid polygon required"}), 400
+    if not date:
+        return jsonify({"error": "date is required"}), 400
 
-                aqi = DUMMY_AQI_GROUPS[tile_index % len(DUMMY_AQI_GROUPS)]
-                tile_index += 1
-                # =================================================================
+    # 1️⃣ GRID GENERATION
+    tiles = generate_tiles_for_polygon(polygon, tile_size_km)
+    bounds = get_polygon_bounds(polygon)
 
+    if not tiles:
+        return jsonify({"error": "No tiles generated for polygon"}), 400
 
-                if aqi is None:
-                    continue
-               
-                display_aqi = int(aqi)
+    tile_results = []
+    aqi_values = []
 
-                # Get color for the display AQI
-                color_info = get_aqi_color(display_aqi)
+    # Dummy AQI (replace later with real AQI)
+    DUMMY_AQI = [25, 75, 110, 155, 190, 260, 310]
 
-                tile_result = {
-                    "tile_id": tile["tile_id"],
-                    "center": tile["center"],
-                    "bounds": tile["bounds"],
-                    "aqi": int(aqi),                 # 10m AQI ONLY
-                    "color": color_info["color"],
-                    "category": color_info["category"],
-                    "label": color_info["label"],
-                    "pm2_5": round(avg_pm2_5, 2) if avg_pm2_5 is not None else None,
-                    "pm10": round(avg_pm10, 2) if avg_pm10 is not None else None,
-                    "pm2_5_0to3m": None,             # disabled
-                    "pm10_0to3m": None,              # disabled
-                    "correction_factor": None        # disabled
-                }
+    for i, tile in enumerate(tiles):
+        aqi = DUMMY_AQI[i % len(DUMMY_AQI)]
+        color_info = get_aqi_color(aqi)
 
-                
-                tile_results.append(tile_result)
-                aqi_values.append(aqi)
-                
-            except Exception as e:
-                logger.error(f"Error processing tile {tile.get('tile_id', 'unknown')}: {str(e)}")
-                continue
-     
-        
-        summary = {
-            "total_tiles": len(tile_results),
-            "avg_aqi": round(sum(aqi_values) / len(aqi_values), 2) if aqi_values else None,
-            "min_aqi": int(min(aqi_values)) if aqi_values else None,
-            "max_aqi": int(max(aqi_values)) if aqi_values else None
-        }
+        tile_results.append({
+            "tile_id": tile["tile_id"],
+            "center": tile["center"],
+            "bounds": tile["bounds"],
+            "aqi": aqi,
+            "color": color_info["color"],
+            "category": color_info["category"],
+            "label": color_info["label"]
+        })
 
-        # 🔥 NEW: Build spatial AQI point cloud (NO LOGIC CHANGE)
-        spatial_points = []
+        aqi_values.append(aqi)
 
-        for tile in tile_results:
-            spatial_points.extend(
-                generate_spatial_points_from_tile(tile, points_per_tile=6)
-            )
+    # 2️⃣ CACHE (IMPORTANT)
+    AQI_TILE_CACHE.clear()
+    AQI_TILE_CACHE["tiles"] = tile_results
+    AQI_TILE_CACHE["polygon"] = polygon
+    AQI_TILE_CACHE["bounds"] = bounds
 
-        AQI_TILE_CACHE["points"] = spatial_points
-        AQI_TILE_CACHE["bounds"] = bounds_data
-
-
-         # NEW: AQI TILE URL (FINAL VISUALIZATION)
-        aqi_tile_url = (
-            f"http://localhost:5000/api/aqi/raster/{{z}}/{{x}}/{{y}}.png"
-            f"?start_date={start_date}&end_date={end_date}"
+    # 3️⃣ SPATIAL POINTS (VIEW ONLY) - Increase density for better interpolation
+    spatial_points = []
+    for tile in tile_results:
+        spatial_points.extend(
+            generate_spatial_points_from_tile(tile, points_per_tile=5)  # Increased from 25 to 50
         )
 
+    AQI_TILE_CACHE["spatial_points"] = spatial_points
+    
+    # Clear tile cache to force regeneration
+    TILE_CACHE.clear()
+    
+    logger.info(f"Generated {len(tile_results)} tiles with {len(spatial_points)} spatial points for polygon")
 
-        # 🔥 Store tiles for raster rendering (NO LOGIC CHANGE)
-        AQI_TILE_CACHE["tiles"] = tile_results
-        AQI_TILE_CACHE["bounds"] = bounds_data
-        AQI_TILE_CACHE["polygon"] = polygon
-
-
-        return jsonify({
-            "tiles": tile_results,
-            "summary": summary,
-            "bounds": bounds_data,
-            "start_date": start_date,
-            "end_date": end_date,
-            "tile_size_km": tile_size_km,
-            "aqi_tile_url": aqi_tile_url  
-        }), 200
-        
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        logger.error(f"Error fetching tile-based AQI data: {str(e)}")
-        logger.error(f"Traceback: {error_trace}")
-        return jsonify({
-            'error': f'Failed to fetch tile-based AQI data: {str(e)}',
-            'details': 'Please check the backend logs for more information'
-        }), 500
+    return jsonify({
+        "tiles": tile_results,
+        "bounds": bounds,
+        "aqi_tile_url": "http://localhost:8000/api/aqi/raster/{z}/{x}/{y}.png"
+    }), 200
 
 
-@app.route("/api/aqi/raster/<int:z>/<int:x>/<int:y>.png", methods=["GET"])
+
+@app.route("/api/aqi/raster/<int:z>/<int:x>/<int:y>.png")
 def aqi_raster_tile(z, x, y):
+
+    cache_key = f"aqi_{z}_{x}_{y}"
+    if cache_key in TILE_CACHE:
+        return send_file(BytesIO(TILE_CACHE[cache_key]), mimetype="image/png")
 
     TILE_SIZE = 256
     img = Image.new("RGBA", (TILE_SIZE, TILE_SIZE))
     pixels = img.load()
 
-    # 🔹 Cached data (NO logic change)
     polygon = AQI_TILE_CACHE.get("polygon")
-    points = AQI_TILE_CACHE.get("points", [])
+    spatial_points = AQI_TILE_CACHE.get("spatial_points", [])
 
-    # 🔹 Safety check
-    if not polygon or not points:
-        buffer = BytesIO()
-        img.save(buffer, format="PNG")
-        buffer.seek(0)
-        return send_file(buffer, mimetype="image/png")
+    if not polygon or not spatial_points:
+        # Return transparent tile instead of empty image
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
 
-    # 🔹 Raster pixel loop
+    # Calculate tile bounds with buffer for better point matching
+    min_lat, min_lon = pixel_to_latlon(0, TILE_SIZE, z, x, y)
+    max_lat, max_lon = pixel_to_latlon(TILE_SIZE, 0, z, x, y)
+    
+    # Increase buffer based on zoom level (higher zoom = smaller buffer needed)
+    buffer = max(0.01, 0.1 / (2 ** (z - 10)))  # Adaptive buffer
+
+    relevant_points = [
+        p for p in spatial_points
+        if min_lat - buffer <= p["lat"] <= max_lat + buffer
+        and min_lon - buffer <= p["lon"] <= max_lon + buffer
+    ]
+
+    # If no relevant points, try using all spatial points (fallback)
+    if not relevant_points:
+        relevant_points = spatial_points
+
+    # Calculate adaptive radius based on zoom level
+    # Higher zoom = smaller radius needed
+    base_radius = 15.0
+    radius_km = base_radius / (2 ** max(0, z - 10))
+    radius_km = max(1.0, min(radius_km, 15.0))  # Clamp between 1 and 15 km
+
+    pixels_rendered = 0
     for py in range(TILE_SIZE):
         for px in range(TILE_SIZE):
-
-            # 1️⃣ pixel → lat/lon
             lat, lon = pixel_to_latlon(px, py, z, x, y)
 
-            # 2️⃣ polygon mask
             if not point_in_polygon(lat, lon, polygon):
                 pixels[px, py] = (0, 0, 0, 0)
                 continue
 
-            # 3️⃣ AQI interpolation (dummy / real – SAME source)
-            aqi = interpolate_aqi(lat, lon, points)
-
+            aqi = interpolate_aqi(lat, lon, relevant_points, radius_km=radius_km)
             if aqi is None:
                 pixels[px, py] = (0, 0, 0, 0)
                 continue
 
-            # 4️⃣ Color
-            color = get_palette_color(aqi)
-            pixels[px, py] = (*color, 170)  # smooth blending
+            r, g, b = get_palette_color(aqi)
+            # Increase alpha for better visibility (150-255 range)
+            alpha = int(min(255, max(150, 100 + (aqi / 300 * 155))))
+            pixels[px, py] = (r, g, b, alpha)
+            pixels_rendered += 1
 
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
+    # Log for debugging
+    if pixels_rendered > 0:
+        logger.debug(f"Tile {z}/{x}/{y}: Rendered {pixels_rendered} pixels, {len(relevant_points)} points, radius={radius_km:.2f}km")
 
-    return send_file(buffer, mimetype="image/png")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    TILE_CACHE[cache_key] = buf.getvalue()
+    buf.seek(0)
+
+    return send_file(buf, mimetype="image/png")
 
 
 
-@app.route("/api/aqi/value", methods=["POST"])
-def get_aqi_at_point():
-    data = request.get_json()
-    lat = data.get("lat")
-    lon = data.get("lon")
 
-    polygon = AQI_TILE_CACHE.get("polygon")
-    points = AQI_TILE_CACHE.get("points", [])
 
-    # Outside selected region → no data
-    if not polygon or not point_in_polygon(lat, lon, polygon):
-        return jsonify({"inside": False})
-
-    # Same interpolation as raster
-    aqi = interpolate_aqi(lat, lon, points)
-
-    if aqi is None:
-        return jsonify({"inside": True, "aqi": None})
-
-    category = get_aqi_category(aqi)
-
-    return jsonify({
-        "inside": True,
-        "aqi": int(aqi),
-        "category": category
-    })
+@app.route('/api/aqi/value', methods=['POST'])
+def get_aqi_value():
+    """
+    Get AQI value for a specific lat/lon point
+    Used for click popups on the map
+    """
+    try:
+        data = request.get_json()
+        lat = data.get('lat')
+        lon = data.get('lon')
+        
+        if lat is None or lon is None:
+            return jsonify({'error': 'Latitude and longitude are required'}), 400
+        
+        polygon = AQI_TILE_CACHE.get("polygon")
+        spatial_points = AQI_TILE_CACHE.get("spatial_points", [])
+        
+        # Check if point is inside polygon
+        inside = False
+        if polygon:
+            inside = point_in_polygon(lat, lon, polygon)
+        
+        if not inside:
+            return jsonify({
+                'inside': False,
+                'aqi': None,
+                'category': None
+            }), 200
+        
+        # Interpolate AQI for this point
+        aqi = interpolate_aqi(lat, lon, spatial_points, radius_km=15.0)
+        
+        if aqi is None:
+            return jsonify({
+                'inside': True,
+                'aqi': None,
+                'category': None
+            }), 200
+        
+        color_info = get_aqi_color(aqi)
+        
+        return jsonify({
+            'inside': True,
+            'aqi': aqi,
+            'category': color_info['category'],
+            'label': color_info['label'],
+            'color': color_info['color']
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting AQI value: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/health', methods=['GET'])
@@ -2914,4 +2972,4 @@ def health_check():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=8000)
