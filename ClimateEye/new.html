@@ -1,0 +1,207 @@
+# using weatherapi.com
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from datetime import datetime, timedelta, timezone
+import requests
+import math
+import os
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("AQI-TILES")
+
+
+app = Flask(__name__)
+CORS(app)
+
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+
+def calculate_aqi(pm25, pm10, o3=None, no2=None, so2=None, co=None):
+
+    def sub_index(c, bps):
+        if c is None:
+            return None
+        for c_lo, c_hi, i_lo, i_hi in bps:
+            if c_lo <= c <= c_hi:
+                return round((i_hi - i_lo) / (c_hi - c_lo) * (c - c_lo) + i_lo)
+        return None
+
+    pm25_bp = [
+        (0,12,0,50),(12.1,35.4,51,100),(35.5,55.4,101,150),
+        (55.5,150.4,151,200),(150.5,250.4,201,300),(250.5,500.4,301,500)
+    ]
+
+    pm10_bp = [
+        (0,54,0,50),(55,154,51,100),(155,254,101,150),
+        (255,354,151,200),(355,424,201,300),(425,604,301,500)
+    ]
+
+    o3_bp = [
+        (0,105.84,0,50),(107.8,137.2,51,100),(139.16,166.6,101,150),
+        (168.56,205.8,151,200),(207.76,392,201,300)
+    ]
+
+    no2_bp = [
+        (0,99.64,0,50),(101.52,188,51,100),(189.88,676.8,101,150),
+        (678.68,1220.12,151,200)
+    ]
+
+    so2_bp = [
+        (0,91.7,0,50),(94.32,196.5,51,100),(199.12,484.7,101,150),
+        (487.32,796.48,151,200)
+    ]
+
+    co_bp = [
+        (0,5038,0,50),(5152.5,10763,51,100),(10877.5,14198,101,150),
+        (14312.5,17633,151,200)
+    ]
+
+    indices = [
+        sub_index(pm25, pm25_bp),
+        sub_index(pm10, pm10_bp),
+        sub_index(o3, o3_bp),
+        sub_index(no2, no2_bp),
+        sub_index(so2, so2_bp),
+        sub_index(co, co_bp),
+    ]
+
+    indices = [i for i in indices if i is not None]
+    return max(indices) if indices else None
+
+
+def point_in_polygon(lat, lon, polygon):
+    inside = False
+    x, y = lon, lat
+
+    for i in range(len(polygon)):
+        lat1, lon1 = polygon[i]
+        lat2, lon2 = polygon[(i + 1) % len(polygon)]
+
+        if ((lat1 > y) != (lat2 > y)) and \
+           (x < (lon2 - lon1) * (y - lat1) / (lat2 - lat1) + lon1):
+            inside = not inside
+
+    return inside
+
+
+def generate_tiles_from_polygon(polygon, tile_size_km=20):
+    lats = [p[0] for p in polygon]
+    lons = [p[1] for p in polygon]
+
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+
+    lat_step = tile_size_km / 111.0
+    
+
+    tiles = []
+
+    lat = min_lat
+    while lat <= max_lat:
+
+        lon_step = tile_size_km / (111.0 * math.cos(math.radians(lat)))
+        
+        lon = min_lon
+        while lon <= max_lon:
+            center_lat = lat + lat_step / 2
+            center_lon = lon + lon_step / 2
+
+            if point_in_polygon(center_lat, center_lon, polygon):
+                tiles.append({
+                    "lat": center_lat,
+                    "lon": center_lon
+                })
+                
+
+            lon += lon_step
+        lat += lat_step
+
+    return tiles
+
+
+def fetch_hourly_aqi_weatherapi(lat, lon):
+    url = "http://api.weatherapi.com/v1/forecast.json"
+    params = {
+        "key": WEATHER_API_KEY,
+        "q": f"{lat},{lon}",
+        "days": 1,
+        "aqi": "yes"
+    }
+
+    r = requests.get(url, params=params, timeout=10)
+    if r.status_code != 200:
+        return None
+
+    hours = r.json()["forecast"]["forecastday"][0]["hour"]
+
+    now = datetime.now(timezone.utc)
+    target = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+    target_ts = target.timestamp()
+
+    selected = None
+    for h in hours:
+        if h["time_epoch"] <= target_ts:
+            selected = h
+
+    if not selected:
+        return None
+
+    aq = selected["air_quality"]
+
+    logger.info(
+        f"API_DATA | lat={lat:.6f}, lon={lon:.6f} | "
+        f"PM2.5={aq.get('pm2_5')} PM10={aq.get('pm10')} "
+        f"O3={aq.get('o3')} NO2={aq.get('no2')} "
+        f"SO2={aq.get('so2')} CO={aq.get('co')}"
+    )
+
+
+    return calculate_aqi(
+        pm25=aq.get("pm2_5"),
+        pm10=aq.get("pm10"),
+        o3=aq.get("o3"),
+        no2=aq.get("no2"),
+        so2=aq.get("so2"),
+        co=aq.get("co")
+    )
+
+
+@app.route("/api/aqi/tiles", methods=["POST"])
+def get_aqi_tiles():
+    data = request.get_json()
+    polygon = data.get("polygon")  # [[lat,lon],...]
+    tile_size_km = data.get("tile_size_km", 20) 
+
+    if not polygon or len(polygon) < 3:
+        return jsonify({"error": "Valid polygon required"}), 400
+
+    tiles = generate_tiles_from_polygon(polygon, tile_size_km)
+
+    spatial_points = []
+
+    for t in tiles:
+        aqi = fetch_hourly_aqi_weatherapi(t["lat"], t["lon"])
+
+        logger.info(f"TILE | lat={t['lat']:.6f}, lon={t['lon']:.6f}, AQI={aqi}")
+
+        if aqi is not None:
+            spatial_points.append({
+                "lat": t["lat"],
+                "lon": t["lon"],
+                "aqi": int(aqi)
+            })
+
+    return jsonify({
+        "hour_used": (datetime.now(timezone.utc) - timedelta(hours=1))
+                        .strftime("%Y-%m-%d %H:00"),
+        "points": spatial_points
+    })
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=9100, debug=True)
